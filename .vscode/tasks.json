@@ -1,0 +1,24 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "torchrun-train-c2i",
+        "type": "shell",
+        "command": "/fs/nexus-scratch/phtu/envs/llama-gen/bin/torchrun",
+        "args": [
+          "--nproc_per_node=1",  // Change to number of GPUs
+          "${file}",
+          "--cloud-save-path", "/fs/nexus-scratch/phtu/AdamAR/train_c2i/",
+          "--code-path", "/fs/nexus-scratch/phtu/AdamAR/imagenet_code_c2i_flip_ten_crop/",
+          "--image-size", "384",
+          "--gpt-model", "GPT-B"
+        ],
+        "options": {
+          "env": {
+            "PYTHONPATH": "${workspaceFolder}"
+          }
+        },
+        "problemMatcher": []
+      }
+    ]
+  }

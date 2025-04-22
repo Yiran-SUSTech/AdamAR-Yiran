@@ -22,6 +22,9 @@ from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
 
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################

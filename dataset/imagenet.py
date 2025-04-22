@@ -20,11 +20,11 @@ class CustomDataset(Dataset):
             self.aug_feature_dir = None
             self.aug_label_dir = None
 
-        # self.feature_files = sorted(os.listdir(feature_dir))
-        # self.label_files = sorted(os.listdir(label_dir))
+        self.feature_files = sorted(os.listdir(feature_dir))
+        self.label_files = sorted(os.listdir(label_dir))
         # TODO: make it configurable
-        self.feature_files = [f"{i}.npy" for i in range(1281167)]
-        self.label_files = [f"{i}.npy" for i in range(1281167)]
+        # self.feature_files = [f"{i}.npy" for i in range(1281167)]
+        # self.label_files = [f"{i}.npy" for i in range(1281167)]
 
     def __len__(self):
         assert len(self.feature_files) == len(self.label_files), \

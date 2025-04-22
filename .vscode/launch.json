@@ -1,0 +1,71 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "extract codes",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "python": "/fs/nexus-scratch/phtu/envs/llama-gen/bin/python3",  // Optional; VS Code auto-detects otherwise
+            "env": {
+              "PYTHONPATH": "${workspaceFolder}"  // Add your custom module path here
+            },
+            "args": [
+
+                "--vq-ckpt", "./pretrained_models/vq_ds16_c2i.pt",
+                "--data-path", "/fs/nexus-datasets/ImageNet21k/processed/imagenet21k_resized/imagenet21k_val/",
+                "--code-path", "/fs/nexus-scratch/phtu/AdamAR/imagenet_code_c2i_flip_ten_crop",
+                "--ten-crop",
+                "--crop-range", "1.1", 
+                "--image-size", "384",
+                "--debug"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "train c2i",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/fs/nexus-scratch/phtu/envs/llama-gen/bin/torchrun",
+            "console": "integratedTerminal",
+            "env": {
+              "PYTHONPATH": "${workspaceFolder}",  // Add your custom module path here
+            //   "TORCH_LOGS": "+dynamo",
+            //   "TORCHDYNAMO_VERBOSE": "1"
+            },
+            "args": [
+                "--nproc_per_node=2",  // Change to number of GPUs
+                "--node_rank=0",
+                "autoregressive/train/train_c2i.py",
+               "--cloud-save-path","/fs/nexus-scratch/phtu/AdamAR/train_c2i",
+                "--code-path", "/fs/nexus-scratch/phtu/AdamAR/imagenet_code_c2i_flip_ten_crop",
+                "--image-size", "384", 
+                "--gpt-model", "GPT-B",
+                "--global-batch-size", "32",
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "sample c2i",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "autoregressive/sample/sample_c2i.py",
+            "console": "integratedTerminal",
+            "python": "/fs/nexus-scratch/phtu/envs/llama-gen/bin/python3",  // Optional; VS Code auto-detects otherwise
+            "env": {
+              "PYTHONPATH": "${workspaceFolder}"  // Add your custom module path here
+            },
+            "args": [
+                "--vq-ckpt", "./pretrained_models/vq_ds16_c2i.pt",
+                "--gpt-ckpt", "./pretrained_models/c2i_L_384.pt",
+                "--gpt-model", "GPT-L",
+                "--image-size", "384",
+            ],
+            "justMyCode": false
+        },
+    ]
+}
