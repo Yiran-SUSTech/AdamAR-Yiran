@@ -48,6 +48,8 @@ class ModelArgs:
     block_size: int = 256
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    
+    adam_block_size: int = 8
 
 
 #################################################################################
@@ -267,6 +269,7 @@ class Transformer(nn.Module):
         self.num_classes = config.num_classes
         self.model_type = config.model_type
         self.cls_token_num = config.cls_token_num
+        self.adam_block_size = config.adam_block_size
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
@@ -285,6 +288,9 @@ class Transformer(nn.Module):
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+        self.medusa_norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.medusa_output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         # 2d rotary pos embedding
         grid_size = int(self.block_size ** 0.5)
@@ -338,12 +344,14 @@ class Transformer(nn.Module):
         mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
     ):
+        assert mask is not None
         if idx is not None and cond_idx is not None: # training or naive inference
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
             token_embeddings = self.tok_embeddings(idx)
             token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis.to(h.device)
+            mask = mask[:, None].to(h.device)
         else:
             if cond_idx is not None: # prefill in inference
                 token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
@@ -364,22 +372,24 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis, input_pos, mask)
         
         # output layers
-        h = self.norm(h)
-        logits = self.output(h).float()
-        
+        h1 = self.norm(h)
+        logits1 = self.output(h1).float()
+        h2 = self.medusa_norm(h)
+        logits2 = self.medusa_output(h2).float()
+
         if self.training:
-            logits = logits[:, self.cls_token_num - 1:].contiguous()
+            logits1 = logits1[:, self.cls_token_num - 1:].contiguous()
 
         # if we are given some desired targets also calculate the loss
         loss = None
         if valid is not None:
-            loss_all = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+            loss_all = F.cross_entropy(logits1.view(-1, logits1.size(-1)), targets.view(-1), reduction='none')
             valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits1.view(-1, logits1.size(-1)), targets.view(-1))
 
-        return logits, loss
+        return logits1, loss
 
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:

@@ -20,7 +20,7 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
-
+from autoregressive.models.utils import get_adam_attention_mask
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -112,6 +112,7 @@ def main(args):
         ffn_dropout_p=dropout_p,
         drop_path_rate=args.drop_path_rate,
         token_dropout_p=args.token_dropout_p,
+        adam_block_size=args.adam_block_size,
     ).to(device)
     logger.info(f"GPT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -169,7 +170,12 @@ def main(args):
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model) # requires PyTorch 2.0        
-    
+
+    #setup adam attention mask
+    width, height = latent_size, latent_size
+    adam_attn_mask = get_adam_attention_mask(width, height, model.adam_block_size, model.cls_token_num)
+    adam_attn_mask = adam_attn_mask.unsqueeze(0).repeat(int(args.global_batch_size // dist.get_world_size()), 1, 1)
+
     model = DDP(model.to(device), device_ids=[args.gpu])
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
@@ -194,7 +200,7 @@ def main(args):
             c_indices = y.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, loss = model(cond_idx=c_indices, idx=z_indices[:,:-1], targets=z_indices)
+                _, loss = model(cond_idx=c_indices, idx=z_indices, targets=z_indices, mask=adam_attn_mask)
             # backward pass, with gradient scaling if training in fp16         
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -279,6 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default='imagenet_code')
     parser.add_argument("--image-size", type=int, choices=[256, 384, 448, 512], default=256)
     parser.add_argument("--downsample-size", type=int, choices=[8, 16], default=16)
+    parser.add_argument("--adam-block-size", type=int, choices=[4,8,16], default=8)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--lr", type=float, default=1e-4)
