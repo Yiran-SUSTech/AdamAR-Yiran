@@ -5,6 +5,18 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "justMyCode": false,
+            "console": "integratedTerminal",
+            "program": "${file}",
+            "env": {
+              "PYTHONPATH": "${workspaceFolder}"  // Add your custom module path here
+            },
+
+        },
+        {
             "name": "extract codes",
             "type": "debugpy",
             "request": "launch",
