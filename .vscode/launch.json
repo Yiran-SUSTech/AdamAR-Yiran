@@ -48,6 +48,7 @@
               "PYTHONPATH": "${workspaceFolder}",  // Add your custom module path here
             //   "TORCH_LOGS": "+dynamo",
             //   "TORCHDYNAMO_VERBOSE": "1"
+             "TORCH_DISTRIBUTED_DEBUG": "DETAIL"
             },
             "args": [
                 "--nproc_per_node=2",  // Change to number of GPUs
@@ -58,6 +59,28 @@
                 "--image-size", "384", 
                 "--gpt-model", "GPT-B",
                 "--global-batch-size", "32",
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "train c2i debug",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "env": {
+              "PYTHONPATH": "${workspaceFolder}",  // Add your custom module path here
+            },
+            "args": [
+                "--nproc_per_node=2",  // Change to number of GPUs
+                "--node_rank=0",
+                "autoregressive/train/train_c2i.py",
+                "--cloud-save-path","/fs/nexus-scratch/phtu/AdamAR/train_c2i",
+                "--code-path", "/fs/nexus-scratch/phtu/AdamAR/imagenet_code_c2i_flip_ten_crop",
+                "--image-size", "384", 
+                "--gpt-model", "GPT-B",
+                "--global-batch-size", "4",
+                "--no-compile"
             ],
             "justMyCode": false
         },
