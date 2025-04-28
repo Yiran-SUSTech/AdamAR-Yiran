@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from typing import NamedTuple
 import torch
 import math
 import pathlib
@@ -7,6 +8,7 @@ import dataclasses
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
+INVALID_TOKEN = -100
 
 
 @dataclasses.dataclass
@@ -24,6 +26,14 @@ class ShiftPattern:
             assert self.x_shift != 0 and self.y_shift != 0, (
                 "Non-axis-aligned shifts must have both shifts non-zero"
             )
+
+
+class TokenMapTensors(NamedTuple):
+    axis_token_indices: torch.Tensor
+    non_axis_token_indices: torch.Tensor
+
+    image_token_indices: torch.Tensor
+    learned_mask: torch.Tensor
 
 
 def get_adam_pattern(
@@ -86,6 +96,49 @@ def get_adam_pattern(
     return patterns, shift_patterns
 
 
+def get_adam_attention_and_token_map(
+    width: int, height: int, base_block_size: int, cond_len: int
+) -> tuple[torch.Tensor, TokenMapTensors]:
+    adam_masks, masked_coords, shift_patterns = _generalized_adam_interlacing(
+        width, height, base_block_size
+    )
+    token_map, input_token_groups = _get_image_token_index_map(
+        width, height, masked_coords, shift_patterns
+    )
+    attention_mask = _get_adam_attention_mask(
+        adam_masks[0], cond_len, token_map, input_token_groups
+    )
+    return attention_mask, _token_map_to_tensors(token_map)
+
+
+def _token_map_to_tensors(token_map: OrderedDict[TOKEN_MAP_KEY_TYPE, list[int]]):
+    len_token_map = len(token_map)
+    axis_token_indices = torch.full((len_token_map,), INVALID_TOKEN, dtype=torch.int)
+    non_axis_token_indices = torch.full(
+        (len_token_map,), INVALID_TOKEN, dtype=torch.int
+    )
+
+    image_token_indices = torch.full((len_token_map,), INVALID_TOKEN, dtype=torch.int)
+    learned_mask = torch.zeros(len_token_map, dtype=torch.bool)
+
+    for idx, (key, value) in enumerate(token_map.items()):
+        match key:
+            case int():
+                image_token_indices[idx] = key
+            case str():
+                learned_mask[idx] = True
+            case _:
+                pass
+
+        axis_token_indices[idx] = value[0]
+        if len(value) == 2:
+            non_axis_token_indices[idx] = value[1]
+
+    return TokenMapTensors(
+        axis_token_indices, non_axis_token_indices, image_token_indices, learned_mask
+    )
+
+
 def _generalized_adam_interlacing(width: int, height: int, base_block_size: int):
     assert width >= base_block_size
     assert height >= base_block_size
@@ -115,7 +168,7 @@ def _generalized_adam_interlacing(width: int, height: int, base_block_size: int)
     return adam_masks, adam_coords, shift_patterns
 
 
-def get_adam_attention_mask(
+def _get_adam_attention_mask(
     first_adam_mask: torch.Tensor, cond_len: int, index_map, input_token_groups
 ) -> torch.Tensor:
     num_first_pass_tokens = first_adam_mask.int().sum()
@@ -140,7 +193,7 @@ def get_adam_attention_mask(
     return attention_mask
 
 
-def get_image_token_index_map(
+def _get_image_token_index_map(
     width: int,
     height: int,
     masked_coords: list[torch.Tensor],
@@ -307,27 +360,23 @@ def _test_input_token_groups(
 def test_adam_utils_consistency():
     width = 32
     height = 32
-    base_block_size = 8
-    cond_len = 100
+    base_block_size = 16
+    cond_len = 1
 
     adam_masks, masked_coords, shift_patterns = _generalized_adam_interlacing(
         width, height, base_block_size
     )
-    index_map, input_token_groups = get_image_token_index_map(
+    index_map, input_token_groups = _get_image_token_index_map(
         width, height, masked_coords, shift_patterns
     )
-    attention_mask = get_adam_attention_mask(
+    attention_mask = _get_adam_attention_mask(
         adam_masks[0], cond_len, index_map, input_token_groups
     )
 
     _test_index_map(index_map, adam_masks, height, width)
     _test_input_token_groups(input_token_groups, width, height, base_block_size)
     _test_attention_mask(attention_mask, input_token_groups, adam_masks[0], cond_len)
-    # import matplotlib.pyplot as plt
-    # plt.imshow(attention_mask)
-    # plt.tight_layout()
-    # plt.savefig("attention_mask.jpg")
-    # plt.close()
+    visualize_adam_masks(adam_masks, f"adam_mask_block_size_{base_block_size}.png")
 
 
 def visualize_adam_masks(masks: list[torch.Tensor], filename: str | pathlib.Path):
