@@ -1,17 +1,74 @@
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import NamedTuple
 import torch
 import math
 import pathlib
-import dataclasses
 
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
-INVALID_TOKEN = -100
+INVALID_TOKEN = -100   
 
 
-@dataclasses.dataclass
+class TokenType(Enum):
+    IMAGE = auto()
+    LEARNED = auto()
+    CONDITION = auto()
+    EMPTY = auto()
+    
+@dataclass(frozen=True)
+class Token(ABC):
+
+    @abstractmethod
+    def token_type(self) -> TokenType:
+        pass
+    
+@dataclass(frozen=True)
+class EmptyToken(Token):
+    def token_type(self) -> TokenType:
+        return TokenType.EMPTY
+
+@dataclass(frozen=True)
+class SpatialToken(Token):
+    x_coord: int 
+    y_coord: int
+
+    def image_index(self, image_width: int) -> int:
+        return self.y_coord * image_width + self.x_coord
+    
+@dataclass(frozen=True)
+class LearnedToken(SpatialToken):
+    def token_type(self):
+        return TokenType.LEARNED
+
+@dataclass(frozen=True)
+class ImageToken(SpatialToken):
+    def token_type(self):
+        return TokenType.IMAGE
+
+@dataclass(frozen=True)
+class ConditionToken(Token):
+    cond_index: int
+
+    def token_type(self):
+        return TokenType.CONDITION
+
+TokenMap = OrderedDict[Token, Token]
+
+@dataclass(frozen=True)
+class AutoRegressiveStructure:
+    token_map: TokenMap
+    attention_mask: torch.Tensor
+    decoding_groups: list[list[int]] | None = None
+    
+    def __post_init__(self):
+        assert self.attention_mask.shape[0] == self.attention_mask.shape[1] == len(self.token_map)
+        
+
+@dataclass
 class ShiftPattern:
     x_shift: int
     y_shift: int
@@ -268,6 +325,92 @@ def _get_image_token_index_map(
     return map, input_token_groups
 
 
+def _get_image_token_index_map_v2(
+    width: int,
+    height: int,
+    cond_len: int,
+    masked_coords: list[torch.Tensor],
+    ) -> AutoRegressiveStructure:
+
+    total_len = width * height + cond_len
+    attention_mask = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool))
+
+    token_map: TokenMap = TokenMap()    
+    first_pass_coords = masked_coords[0].tolist()
+    first_image_token = ImageToken(x_coord=first_pass_coords[0][0], y_coord=first_pass_coords[0][1])
+    attention_mask[cond_len+len(first_pass_coords):, cond_len+len(first_pass_coords):] = 0
+    
+    bi_attention_size = total_len - cond_len - len(first_pass_coords)
+    num_generated_tokens_per_pass = [len(coords) for coords in masked_coords[1:]]
+    assert sum(num_generated_tokens_per_pass) == bi_attention_size
+    bi_attention_mask = torch.zeros((bi_attention_size , bi_attention_size), dtype=torch.bool)
+    
+    num_prev_tokens = 0
+    for num in num_generated_tokens_per_pass:
+        num_prev_tokens += num
+        bi_attention_mask[num_prev_tokens-num:num_prev_tokens, :num_prev_tokens] = 1
+    
+    #prepare attention mask
+    attention_mask[cond_len+len(first_pass_coords):, cond_len+len(first_pass_coords):] = bi_attention_mask
+
+    # add condition tokens
+    for i in range(cond_len):
+        cond_token = ConditionToken(cond_index=i)
+        if i == cond_len - 1:
+            token_map[cond_token] = first_image_token
+        else:
+            token_map[cond_token] =  EmptyToken()
+
+    # autoregressive first pass
+    for idx in range(len(first_pass_coords) - 1):
+        curr_coords = first_pass_coords[idx]
+        next_coords = first_pass_coords[idx + 1]
+                
+        curr_x, curr_y = curr_coords
+        next_x, next_y = next_coords
+        
+        curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
+        next_img_token = ImageToken(x_coord=next_x, y_coord=next_y)
+        token_map[curr_img_token] = next_img_token
+
+        if idx == len(first_pass_coords) - 2:
+            last_img_token = next_img_token
+            token_map[last_img_token] = EmptyToken()
+    
+    # passes with learnable tokens
+    for i_pass in range(1, len(masked_coords)):
+        curr_coords = masked_coords[i_pass].tolist()
+        if i_pass == 1:
+            # learnable token
+            for idx, coord in enumerate(curr_coords):
+                x, y = coord
+                learnable_token = LearnedToken(x_coord=x, y_coord=y)
+                pred_img_token = ImageToken(x_coord=x, y_coord=y)
+                token_map[learnable_token] = pred_img_token
+                # input_token_group.append(curr_img_token)
+        else:
+            previous_coords = masked_coords[i_pass - 1].tolist()
+            prev_coord_len = len(previous_coords)
+            assert prev_coord_len == len(curr_coords) // 2
+            for prev_coord, curr_coord in zip(previous_coords, curr_coords[:prev_coord_len]):
+                prev_x, prev_y = prev_coord
+                curr_x, curr_y = curr_coord
+                prev_img_token = ImageToken(x_coord=prev_x, y_coord=prev_y)
+                curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
+                
+                token_map[prev_img_token] = curr_img_token
+        
+            for curr_coord in curr_coords[prev_coord_len:]:
+                x, y = curr_coord
+                learnable_token = LearnedToken(x_coord=x, y_coord=y)
+                token_map[learnable_token] = ImageToken(x_coord=x, y_coord=y)
+    
+    return AutoRegressiveStructure(
+        token_map=token_map,
+        attention_mask=attention_mask,
+    )
+    
+
 def _test_attention_mask(attention_mask, input_token_groups, first_adam_mask, cond_len):
     num_first_pass_tokens = first_adam_mask.int().sum()
     for input_ind in range(attention_mask.shape[0]):
@@ -369,6 +512,9 @@ def test_adam_utils_consistency():
     index_map, input_token_groups = _get_image_token_index_map(
         width, height, masked_coords, shift_patterns
     )
+    _get_image_token_index_map_v2(
+        width,height,cond_len, masked_coords,
+    )
     attention_mask = _get_adam_attention_mask(
         adam_masks[0], cond_len, index_map, input_token_groups
     )
@@ -393,12 +539,4 @@ def visualize_adam_masks(masks: list[torch.Tensor], filename: str | pathlib.Path
 
 
 if __name__ == "__main__":
-    # width, height = 16, 16
-    # base_block_size = 8
-    # cond_len = 2
-    # masks, _, _ = _generalized_adam_interlacing(width, height, base_block_size)
-    # attention_mask = _get_attention_mask_from_adam(cond_len, masks)
-    # test_attention_mask(cond_len, attention_mask, masks)
-    # get_output_pred_index_map(width, height, base_block_size, cond_len)
-    # test_index_map()
     test_adam_utils_consistency()
