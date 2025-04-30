@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
+from autoregressive.models.utils import get_autoregressive_structure
 
 
 def find_multiple(n: int, k: int):
@@ -279,6 +280,13 @@ class Transformer(nn.Module):
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.tok_dropout = nn.Dropout(config.token_dropout_p)
 
+        # auxiliary autoregressive training/generation structure
+        width = int(config.block_size ** 0.5)
+        height = width
+        self.auto_regr_struct = get_autoregressive_structure(width=width, height=height, base_block_size=config.adam_block_size, cond_len=config.cls_token_num)
+        self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
+        
+        
         # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
@@ -288,9 +296,6 @@ class Transformer(nn.Module):
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
-
-        self.medusa_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.medusa_output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         # 2d rotary pos embedding
         grid_size = int(self.block_size ** 0.5)
@@ -341,17 +346,16 @@ class Transformer(nn.Module):
         cond_idx: torch.Tensor,  # cond_idx_or_embed
         input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
     ):
-        assert mask is not None
+        assert targets is None
         if idx is not None and cond_idx is not None: # training or naive inference
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
             token_embeddings = self.tok_embeddings(idx)
-            token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
-            h = self.tok_dropout(token_embeddings)
-            self.freqs_cis = self.freqs_cis.to(h.device)
-            mask = mask[:, None].to(h.device)
+            assem_input_embeddings, assem_freqs_cis = self.auto_regr_struct.assemble_input_tokens(token_embeddings, cond_embeddings, self.learnable_pos_embedding, self.freqs_cis.to(idx.device))
+            # token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
+            h = self.tok_dropout(assem_input_embeddings)
+            # self.freqs_cis = self.freqs_cis.to(h.device)
         else:
             if cond_idx is not None: # prefill in inference
                 token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
@@ -363,34 +367,41 @@ class Transformer(nn.Module):
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis
         
-        if self.training:
-            freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
-        else:
-            freqs_cis = self.freqs_cis[input_pos]
+        # if self.training:
+        #     freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
+        # else:
+        #     freqs_cis = self.freqs_cis[input_pos]
         # transformer blocks
         for layer in self.layers:
-            h = layer(h, freqs_cis, input_pos, mask)
+            h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.attention_mask.to(h.device))
         
         # output layers
-        h1 = self.norm(h)
-        logits1 = self.output(h1).float()
-        h2 = self.medusa_norm(h)
-        logits2 = self.medusa_output(h2).float()
+        h = self.norm(h)
+        logits = self.output(h).float()
+        # if self.training:
+        #     logits = logits[:, self.cls_token_num - 1:].contiguous()
 
-        if self.training:
-            logits1 = logits1[:, self.cls_token_num - 1:].contiguous()
-
+        targets, valid = self.auto_regr_struct.assemble_target_tokens(image_token_idx=idx) 
         # if we are given some desired targets also calculate the loss
         loss = None
         if valid is not None:
-            loss_all = F.cross_entropy(logits1.view(-1, logits1.size(-1)), targets.view(-1), reduction='none')
-            valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
+            loss_all = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
+            )
+            valid_all = valid.view(-1) # valid[:, None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
-            loss = F.cross_entropy(logits1.view(-1, logits1.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        return logits1, loss
+        return logits, loss
 
+    # def forward_inference(
+    #     self,
+    #     x: torch.Tensor, 
+    #     freqs_cis: torch.Tensor, 
+    #     input_pos: torch.Tensor,
+    # ):
+    #     pass
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
