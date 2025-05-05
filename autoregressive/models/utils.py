@@ -8,7 +8,7 @@ from typing import NamedTuple
 import torch
 from beartype import beartype as typechecker
 from jaxtyping import Float, Int, Int64, jaxtyped
-
+import torchvision
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
@@ -124,14 +124,14 @@ class TokenMapTensors_v2:
 
 @dataclass(frozen=True)
 class AutoRegressiveStructure:
+    token_map: TokenMap
     token_map_tensors: TokenMapTensors_v2
-    attention_mask: torch.Tensor
-    decoding_groups: list[list[int]] | None = None
+    
+    cond_len: int
+    total_len: int
+    attention_mask: torch.Tensor | None = None
 
-    # _total_len: int | None = None
-    def __post_init__(self):
-        # self._total_len = self.attention_mask.shape[0]
-        assert self.attention_mask.shape[0] == self.attention_mask.shape[1]
+    #  _total_len: int | None = None       
 
     @jaxtyped(typechecker=typechecker)
     def assemble_input_tokens(
@@ -171,6 +171,18 @@ class AutoRegressiveStructure:
         return input_tokens, freqs_cis
 
     @jaxtyped(typechecker=typechecker)
+    def assemble_positional_embedding(
+        self,
+        freqs_cis: Float[torch.Tensor, "total_len _ 2"],
+    ):
+        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+        freqs_cis[~cond_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[~cond_mask]
+        ]
+        
+        return freqs_cis
+    
+    @jaxtyped(typechecker=typechecker)
     def assemble_target_tokens(
         self,
         image_token_idx: Int64[torch.Tensor, "batch_size image_len"],
@@ -203,7 +215,114 @@ class AutoRegressiveStructure:
 
         return target_tokens, target_mask
 
+    def assemble_input_tokens_for_decoding(
+        self,
+        image_tokens: Float[torch.Tensor, "batch_size image_len embed_dim"],
+        cond_tokens: Float[torch.Tensor, "batch_size cond_len embed_dim"],
+        learnable_token: Float[torch.Tensor, "embed_dim"],
+        freqs_cis: Float[torch.Tensor, "total_len _ 2"],
+        device: torch.device | None = None,
+    ):
+        if device is None:
+            device = image_tokens.device
 
+        batch_size, _, _ = image_tokens.shape
+        num_total_tokens = self.token_map_tensors.out_token_indices.shape[0]
+        embed_dim = image_tokens.shape[-1]
+
+        input_tokens = torch.zeros(
+            batch_size, num_total_tokens, embed_dim, device=device
+        )
+        image_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        learned_mask = self.token_map_tensors.in_token_types == TokenType.LEARNED.value
+        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+
+        image_indices = self.token_map_tensors.in_token_indices[image_mask]
+        reordered_image_tokens = image_tokens[:, image_indices, :]
+
+        input_tokens[:, image_mask, :] = reordered_image_tokens
+        input_tokens[:, learned_mask, :] = learnable_token
+        input_tokens[:, cond_mask, :] = cond_tokens
+
+        freqs_cis[~cond_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[~cond_mask]
+        ]
+
+        return input_tokens, freqs_cis
+    
+    def fastest_decoding_schedule(self):
+        # the decoding schedule dependent on the token map
+        # which several output tokens can be generated at once
+        # this will require the output token to not dependent on the input token that has not been generated yet
+
+        total_len = len(self.token_map.keys())
+        list_input_tokens = list(self.token_map.keys())
+        list_output_tokens = list(self.token_map.values())
+        
+        prev_output_tokens: set[Token] = {EmptyToken()}
+        parallel_decoding_groups= []
+        
+        start = self.cond_len - 1
+        end = self.cond_len
+        tmp_parallel_decoding_idx = [start]
+        while end < len(self.token_map):
+            if list_input_tokens[end] in prev_output_tokens or list_input_tokens[end].token_type() == TokenType.LEARNED:
+                tmp_parallel_decoding_idx.append(end)
+                end += 1
+                # print(f"start: {start}, end: {end}, tmp_parallel_decoding_idx: {tmp_parallel_decoding_idx}")
+            else:
+                parallel_decoding_groups.append(tmp_parallel_decoding_idx)
+                prev_output_tokens.update({list_output_tokens[idx] for idx in range(start, end)})
+                start = end
+                end = start + 1
+                tmp_parallel_decoding_idx = [start]
+                # print(prev_output_tokens)
+                # print(f"start: {start}, end: {end}, tmp_parallel_decoding_idx: {tmp_parallel_decoding_idx}")
+
+        parallel_decoding_groups.append(tmp_parallel_decoding_idx)
+        return parallel_decoding_groups
+    
+    def get_training_attention_mask(self, parallel_decoding_groups: list[list[int]]):
+
+        attention_mask = torch.zeros(self.total_len, self.total_len, dtype=torch.bool)
+        attention_mask[:self.cond_len, :self.cond_len] = torch.tril(torch.ones(self.cond_len, self.cond_len, dtype=torch.bool))
+        prev_decoded_idx = list(range(0, self.cond_len-1))
+        for idx in range(len(parallel_decoding_groups)):
+            prev_decoded_idx.extend(parallel_decoding_groups[idx])
+            
+            rows, cols  = torch.meshgrid(
+                torch.tensor(parallel_decoding_groups[idx]), torch.tensor(prev_decoded_idx), indexing="ij"
+            )
+            attention_mask[rows, cols] = 1
+
+        # torchvision.utils.save_image(
+        #         (self.attention_mask == attention_mask).float(), "attention_test.png",
+        # )
+        return attention_mask
+    
+    
+    @torch.no_grad()
+    def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
+        if model.model_type == 'c2i':
+            if cfg_scale > 1.0:
+                cond_null = torch.ones_like(cond) * model.num_classes
+                cond_combined = torch.cat([cond, cond_null])
+            else:
+                cond_combined = cond
+            T = 1
+        elif model.model_type == 't2i':
+            if cfg_scale > 1.0:
+                cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+                cond_combined = torch.cat([cond, cond_null])
+            else:
+                cond_combined = cond
+            T = cond.shape[1]      
+        else:
+            raise Exception("please check model type")
+        
+        # first step 
+        model()
+    
 @dataclass
 class ShiftPattern:
     x_shift: int
@@ -552,7 +671,10 @@ def _get_image_token_index_map_v2(
 
     token_map_tensors = TokenMapTensors_v2(token_map, width, height)
     return AutoRegressiveStructure(
+        token_map=token_map,
         token_map_tensors=token_map_tensors,
+        cond_len=cond_len,
+        total_len=total_len,
         attention_mask=attention_mask,
     )
 
@@ -571,3 +693,6 @@ def get_autoregressive_structure(
         masked_coords,
     )
     return ar_structure
+
+
+    

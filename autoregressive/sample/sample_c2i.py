@@ -45,7 +45,7 @@ def main(args):
         model_type=args.gpt_type,
     ).to(device=device, dtype=precision)
     
-    checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+    checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
     if args.from_fsdp: # fspd
         model_weight = checkpoint
     elif "model" in checkpoint:  # ddp
@@ -74,17 +74,24 @@ def main(args):
         print(f"no need to compile model in demo") 
 
     # Labels to condition the model with (feel free to change):
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+    class_labels = [0] #[207, 360, 387, 974, 88, 979, 417, 279]
     c_indices = torch.tensor(class_labels, device=device)
     qzshape = [len(class_labels), args.codebook_embed_dim, latent_size, latent_size]
 
     t1 = time.time()
-    index_sample = generate(
-        gpt_model, c_indices, latent_size ** 2,
-        cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
-        temperature=args.temperature, top_k=args.top_k,
-        top_p=args.top_p, sample_logits=True, 
-        )
+    # index_sample = generate(
+    #     gpt_model, c_indices, latent_size ** 2,
+    #     cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
+    #     temperature=args.temperature, top_k=args.top_k,
+    #     top_p=args.top_p, sample_logits=True, 
+    #     )
+
+    index_sample = gpt_model.generate(c_indices, cfg_scales=(1.0, 1.0),
+                       temperature=args.temperature, 
+                       top_k=args.top_k,
+                       top_p=args.top_p)
+
+
     sampling_time = time.time() - t1
     print(f"gpt sampling takes about {sampling_time:.2f} seconds.")    
     

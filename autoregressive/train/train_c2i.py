@@ -149,7 +149,7 @@ def main(args):
 
     # Prepare models for training:
     if args.gpt_ckpt:
-        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
