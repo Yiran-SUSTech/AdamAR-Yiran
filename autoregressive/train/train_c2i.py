@@ -299,5 +299,6 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     args = parser.parse_args()
     main(args)

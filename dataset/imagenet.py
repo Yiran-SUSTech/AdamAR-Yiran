@@ -6,7 +6,7 @@ from torchvision.datasets import ImageFolder
 
 
 class CustomDataset(Dataset):
-    def __init__(self, feature_dir, label_dir):
+    def __init__(self, feature_dir, label_dir, num_datapoints: int| None =None):
         self.feature_dir = feature_dir
         self.label_dir = label_dir
         self.flip =  False # 'flip' in self.feature_dir
@@ -20,16 +20,12 @@ class CustomDataset(Dataset):
             self.aug_feature_dir = None
             self.aug_label_dir = None
 
-        # self.feature_files = sorted(os.listdir(feature_dir))
-        # self.label_files = sorted(os.listdir(label_dir))
-        # TODO: make it configurable
-        # self.feature_files = [f"{i}.npy" for i in range(1)]
-        # self.label_files = [f"{i}.npy" for i in range(1)]
-
-        self.feature_files = [f"{0}.npy" for i in range(10000)]
-        self.label_files = [f"{0}.npy" for i in range(10000)]
-
-
+        self.feature_files = sorted(os.listdir(feature_dir))
+        self.label_files = sorted(os.listdir(label_dir))
+        if num_datapoints is not None:
+            self.feature_files = [self.feature_files[i%num_datapoints] for i in range(len(self.feature_files))] # sample only num_datapoints files
+            self.label_files = [self.label_files[i%num_datapoints] for i in range(len(self.label_files))] # sample only num_datapoints files
+                
     def __len__(self):
         assert len(self.feature_files) == len(self.label_files), \
             "Number of feature files and label files should be same"
@@ -63,6 +59,7 @@ def build_imagenet(args, transform):
 def build_imagenet_code(args):
     feature_dir = f"{args.code_path}/imagenet{args.image_size}_codes"
     label_dir = f"{args.code_path}/imagenet{args.image_size}_labels"
+    num_datapoints = args.num_datapoints
     assert os.path.exists(feature_dir) and os.path.exists(label_dir), \
         f"please first run: bash scripts/autoregressive/extract_codes_c2i.sh ..."
-    return CustomDataset(feature_dir, label_dir)
+    return CustomDataset(feature_dir, label_dir, num_datapoints)
