@@ -8,7 +8,6 @@ from typing import NamedTuple
 import torch
 from beartype import beartype as typechecker
 from jaxtyping import Float, Int, Int64, jaxtyped
-import torchvision
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
@@ -131,7 +130,6 @@ class AutoRegressiveStructure:
     total_len: int
     attention_mask: torch.Tensor | None = None
 
-    #  _total_len: int | None = None       
 
     @jaxtyped(typechecker=typechecker)
     def assemble_input_tokens(
@@ -269,16 +267,13 @@ class AutoRegressiveStructure:
             if list_input_tokens[end] in prev_output_tokens or list_input_tokens[end].token_type() == TokenType.LEARNED:
                 tmp_parallel_decoding_idx.append(end)
                 end += 1
-                # print(f"start: {start}, end: {end}, tmp_parallel_decoding_idx: {tmp_parallel_decoding_idx}")
             else:
                 parallel_decoding_groups.append(tmp_parallel_decoding_idx)
                 prev_output_tokens.update({list_output_tokens[idx] for idx in range(start, end)})
                 start = end
                 end = start + 1
                 tmp_parallel_decoding_idx = [start]
-                # print(prev_output_tokens)
-                # print(f"start: {start}, end: {end}, tmp_parallel_decoding_idx: {tmp_parallel_decoding_idx}")
-
+                
         parallel_decoding_groups.append(tmp_parallel_decoding_idx)
         return parallel_decoding_groups
     
@@ -300,28 +295,6 @@ class AutoRegressiveStructure:
         # )
         return attention_mask
     
-    
-    @torch.no_grad()
-    def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
-        if model.model_type == 'c2i':
-            if cfg_scale > 1.0:
-                cond_null = torch.ones_like(cond) * model.num_classes
-                cond_combined = torch.cat([cond, cond_null])
-            else:
-                cond_combined = cond
-            T = 1
-        elif model.model_type == 't2i':
-            if cfg_scale > 1.0:
-                cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
-                cond_combined = torch.cat([cond, cond_null])
-            else:
-                cond_combined = cond
-            T = cond.shape[1]      
-        else:
-            raise Exception("please check model type")
-        
-        # first step 
-        model()
     
 @dataclass
 class ShiftPattern:
@@ -693,6 +666,3 @@ def get_autoregressive_structure(
         masked_coords,
     )
     return ar_structure
-
-
-    

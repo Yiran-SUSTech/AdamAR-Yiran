@@ -363,7 +363,7 @@ class Transformer(nn.Module):
             input_pos: [query_num] Position index for each token
         """
 
-        bs = x.shape[0]
+        # TODO: add support for KV cache using input_pos 
         
         assert self.auto_regr_struct.attention_mask is not None
         mask = self.auto_regr_struct.attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
@@ -386,25 +386,16 @@ class Transformer(nn.Module):
         cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
         token_embeddings = self.tok_embeddings(idx)
         assem_input_embeddings, assem_freqs_cis = self.auto_regr_struct.assemble_input_tokens(token_embeddings, cond_embeddings, self.learnable_pos_embedding, self.freqs_cis.to(idx.device))
-        # token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
+
         h = self.tok_dropout(assem_input_embeddings)
-        # self.freqs_cis = self.freqs_cis.to(h.device)
         
         assert self.auto_regr_struct.attention_mask is not None
-        # if self.training:
-        #     freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
-        # else:
-        #     freqs_cis = self.freqs_cis[input_pos]
-        # transformer blocks
+
         for layer in self.layers:
             h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.attention_mask.to(h.device))
         
-        # output layers
         h = self.norm(h)
         logits = self.output(h).float()
-        # if self.training:
-        #     logits = logits[:, self.cls_token_num - 1:].contiguous()
-
         targets, valid = self.auto_regr_struct.assemble_target_tokens(image_token_idx=idx) 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -418,14 +409,6 @@ class Transformer(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
-
-    # def forward_inference(
-    #     self,
-    #     x: torch.Tensor, 
-    #     freqs_cis: torch.Tensor, 
-    #     input_pos: torch.Tensor,
-    # ):
-    #     pass
 
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
@@ -442,16 +425,13 @@ class Transformer(nn.Module):
         self.freqs_cis = self.freqs_cis.to(cond_idx.device)
         assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
 
-        # self.auto_regr_struct.attention_mask = self.auto_regr_struct.attention_mask.to(cond_idx.device)
         bs = cond_idx.shape[0]        
         decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
         
-        # Step-3: Prepare CFG
+
         if cfg_scales[-1] > 1.0:
             cond_null = torch.ones_like(cond_idx) * self.num_classes
             cond_combined = torch.cat([cond_idx, cond_null])
-            # img_token_freq_cis = torch.cat([img_token_freq_cis, img_token_freq_cis])
-            # position_instruction_tokens = torch.cat([position_instruction_tokens, position_instruction_tokens])
             bs *= 2
         else:
             cond_combined = cond_idx
@@ -460,9 +440,11 @@ class Transformer(nn.Module):
 
         # prepare for the first step 
         x =  cond_combined_tokens[:, :self.cls_token_num, :]
-        freqs_cis = assembled_freq_cis[:self.cls_token_num] # [None].repeat(x.shape[0], 1, 1, 1)
+        freqs_cis = assembled_freq_cis[:self.cls_token_num]
 
         input_pos = torch.arange(0, x.shape[1])
+        
+        # TODO: add support for KV cache (below code is from RandAR)
         # Step-4: KV Cache setup
         # max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
         # with torch.device(cond.device):
@@ -477,7 +459,6 @@ class Transformer(nn.Module):
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
             logits = self.forward_inference(x, freqs_cis, input_pos) 
-            # apply CFG
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
@@ -490,9 +471,6 @@ class Transformer(nn.Module):
 
             for idx, decoded_token_idx in enumerate(decoded_token_group):
                 decoded_indices[:, decoded_token_idx] = indices[:, idx]
-
-            # self.tok_embeddings(indices)
-            # img_token = self.tok_embeddings(indices)
             
             next_decoded_token_group = decoding_schedule[decoding_step + 1]
             next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
@@ -515,13 +493,11 @@ class Transformer(nn.Module):
         
             assert x.shape[1] == freqs_cis.shape[0]
     
-
         decoding_step = len(decoding_schedule) - 1
         decoded_token_group = decoding_schedule[decoding_step]
         num_decoded_tokens = len(decoded_token_group)
         query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
         logits = self.forward_inference(x, freqs_cis, input_pos) 
-        # apply CFG
         if cfg_scales[-1] > 1.0:
             cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
             cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
@@ -541,15 +517,6 @@ class Transformer(nn.Module):
         _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
         final_decoded_indices = decoded_indices[:, back_order]
         return final_decoded_indices
-
-            # # Step-1: Prepare input tokens
-            # input_tokens = torch.cat([input_tokens, result_indices[:, decoded_token_group]], dim=1)
-            # input_pos = torch.arange(input_tokens.shape[1], device=input_tokens.device).unsqueeze(0).repeat(input_tokens.shape[0], 1)
-            # input_pos = input_pos[:, -self.block_size:]
-            # input_tokens = input_tokens[:, -self.block_size:]
-
-            # # Step-2: Forward pass
-            # pass
             
 #################################################################################
 #                      Rotary Positional Embedding Functions                    #
