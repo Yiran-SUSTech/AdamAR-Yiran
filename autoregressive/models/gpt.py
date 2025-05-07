@@ -424,11 +424,8 @@ class Transformer(nn.Module):
         
         self.freqs_cis = self.freqs_cis.to(cond_idx.device)
         assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
-
         bs = cond_idx.shape[0]        
         decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
-        
-
         if cfg_scales[-1] > 1.0:
             cond_null = torch.ones_like(cond_idx) * self.num_classes
             cond_combined = torch.cat([cond_idx, cond_null])
@@ -437,28 +434,49 @@ class Transformer(nn.Module):
             cond_combined = cond_idx
     
         cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
-
-        # prepare for the first step 
-        x =  cond_combined_tokens[:, :self.cls_token_num, :]
-        freqs_cis = assembled_freq_cis[:self.cls_token_num]
-
-        input_pos = torch.arange(0, x.shape[1])
-        
+        x = torch.empty([bs, 0, self.config.dim], device=cond_idx.device, dtype=cond_combined_tokens.dtype)
+        input_pos = torch.empty(0, device=cond_idx.device, dtype=torch.long)
+            
         # TODO: add support for KV cache (below code is from RandAR)
         # Step-4: KV Cache setup
         # max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
         # with torch.device(cond.device):
         #     self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
-
+        
         input_token_config = list(self.auto_regr_struct.token_map.keys())
         output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.values())}
         
         decoding_schedule = self.auto_regr_struct.fastest_decoding_schedule()
-        for decoding_step in range(len(decoding_schedule)-1):
+        for decoding_step in range(len(decoding_schedule)):
+            next_decoded_token_group = decoding_schedule[decoding_step]
+            next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
+            for idx, next_decoded_token_idx in enumerate(next_decoded_token_group):
+                input_token = input_token_config[next_decoded_token_idx]
+                input_token_type = input_token.token_type()
+                match input_token_type:
+                    case TokenType.IMAGE:
+                        tmp = output_token_config[input_token]
+                        next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
+                    case TokenType.LEARNED:
+                        next_embeddings[:, idx, :]  = self.learnable_pos_embedding[None, None]
+                    case TokenType.CONDITION:
+                        next_embeddings[:, idx, :] = cond_combined_tokens[:, input_token.cond_index, :]
+                    case _:
+                        assert False, f"Invalid token type {input_token_type}"     
+                                                              
+            if cfg_scales[-1] > 1.0:
+                next_embeddings = torch.cat([next_embeddings, next_embeddings], dim=0)
+
+            x = torch.cat([x, next_embeddings], dim=1)
+            input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
+            freqs_cis = assembled_freq_cis[input_pos]
+        
+            assert x.shape[1] == freqs_cis.shape[0]
+
             decoded_token_group = decoding_schedule[decoding_step]
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
-            logits = self.forward_inference(x, freqs_cis, input_pos) 
+            logits = self.forward_inference(x, freqs_cis, input_pos)
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
@@ -472,45 +490,6 @@ class Transformer(nn.Module):
             for idx, decoded_token_idx in enumerate(decoded_token_group):
                 decoded_indices[:, decoded_token_idx] = indices[:, idx]
             
-            next_decoded_token_group = decoding_schedule[decoding_step + 1]
-            next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
-            for idx, next_decoded_token_idx in enumerate(next_decoded_token_group):
-                input_token = input_token_config[next_decoded_token_idx]
-                if input_token.token_type() == TokenType.IMAGE:
-                    tmp = output_token_config[input_token]
-                    next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
-                elif input_token.token_type() == TokenType.LEARNED:
-                    next_embeddings[:, idx, :]  = self.learnable_pos_embedding[None, None]
-                else:
-                    assert False, f"Invalid token type {input_token.token_type()}"                   
-        
-            if cfg_scales[-1] > 1.0:
-                next_embeddings = torch.cat([next_embeddings, next_embeddings], dim=0)
-
-            x = torch.cat([x, next_embeddings], dim=1)
-            input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group)], dim=0)
-            freqs_cis = assembled_freq_cis[input_pos]
-        
-            assert x.shape[1] == freqs_cis.shape[0]
-    
-        decoding_step = len(decoding_schedule) - 1
-        decoded_token_group = decoding_schedule[decoding_step]
-        num_decoded_tokens = len(decoded_token_group)
-        query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
-        logits = self.forward_inference(x, freqs_cis, input_pos) 
-        if cfg_scales[-1] > 1.0:
-            cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
-            cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
-            logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
-
-        logits = logits[:, -num_decoded_tokens:] # [bs, query_num, vocab_size]
-        indices = torch.zeros(decoded_indices.shape[0], num_decoded_tokens, dtype=torch.long, device=x.device)
-        for i in range(num_decoded_tokens):
-            indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
-
-        for idx, decoded_token_idx in enumerate(decoded_token_group):
-            decoded_indices[:, decoded_token_idx] = indices[:, idx]
-        
         
         image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
         decoded_indices = decoded_indices[:, image_mask]
