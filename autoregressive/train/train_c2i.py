@@ -20,7 +20,6 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
-from autoregressive.models.utils import get_adam_attention_mask
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -150,7 +149,7 @@ def main(args):
 
     # Prepare models for training:
     if args.gpt_ckpt:
-        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
@@ -171,11 +170,11 @@ def main(args):
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model) # requires PyTorch 2.0        
 
-    #setup adam attention mask
-    width, height = latent_size, latent_size
-    adam_attn_mask = get_adam_attention_mask(width, height, model.adam_block_size, model.cls_token_num)
-    adam_attn_mask = adam_attn_mask.unsqueeze(0).repeat(int(args.global_batch_size // dist.get_world_size()), 1, 1)
-
+    # #setup adam attention mask
+    # width, height = latent_size, latent_size
+    # adam_attn_mask = get_adam_attention_mask(width, height, model.adam_block_size, model.cls_token_num)
+    # adam_attn_mask = adam_attn_mask.unsqueeze(0).repeat(int(args.global_batch_size // dist.get_world_size()), 1, 1)
+    
     model = DDP(model.to(device), device_ids=[args.gpu])
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
@@ -200,7 +199,7 @@ def main(args):
             c_indices = y.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
             with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, loss = model(cond_idx=c_indices, idx=z_indices, targets=z_indices, mask=adam_attn_mask)
+                _, loss = model(cond_idx=c_indices, idx=z_indices)
             # backward pass, with gradient scaling if training in fp16         
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -300,5 +299,6 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     args = parser.parse_args()
     main(args)

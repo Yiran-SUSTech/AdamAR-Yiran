@@ -1,17 +1,299 @@
-from collections import OrderedDict
-from typing import NamedTuple
-import torch
 import math
-import pathlib
-import dataclasses
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import NamedTuple
 
+import torch
+from beartype import beartype as typechecker
+from jaxtyping import Float, Int, Int64, jaxtyped
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
 INVALID_TOKEN = -100
 
 
-@dataclasses.dataclass
+class TokenType(Enum):
+    @staticmethod
+    def _generate_next_value_(name, start, count, last_values):
+        return torch.iinfo(torch.int).min + count
+
+    IMAGE = auto()
+    LEARNED = auto()
+    CONDITION = auto()
+    EMPTY = auto()
+
+
+@dataclass(frozen=True)
+class Token(ABC):
+    @abstractmethod
+    def token_type(self) -> TokenType:
+        pass
+
+
+@dataclass(frozen=True)
+class EmptyToken(Token):
+    def token_type(self) -> TokenType:
+        return TokenType.EMPTY
+
+
+@dataclass(frozen=True)
+class SpatialToken(Token):
+    x_coord: int
+    y_coord: int
+
+    def image_index(self, image_width: int) -> int:
+        return self.y_coord * image_width + self.x_coord
+
+
+@dataclass(frozen=True)
+class LearnedToken(SpatialToken):
+    def token_type(self):
+        return TokenType.LEARNED
+
+
+@dataclass(frozen=True)
+class ImageToken(SpatialToken):
+    def token_type(self):
+        return TokenType.IMAGE
+
+
+@dataclass(frozen=True)
+class ConditionToken(Token):
+    cond_index: int
+
+    def token_type(self):
+        return TokenType.CONDITION
+
+
+TokenMap = OrderedDict[Token, Token]
+
+
+@dataclass
+class TokenMapTensors_v2:
+    # input tokens
+    in_token_indices: Int[torch.Tensor, "num_total_tokens"]
+    in_token_types: Int[torch.Tensor, "num_total_tokens"]
+
+    # output tokens
+    out_token_indices: Int[torch.Tensor, "num_total_tokens"]
+    out_token_types: Int[torch.Tensor, "num_total_tokens"]
+
+    def __init__(self, token_map, width: int, height: int):
+        num_total_tokens = len(token_map)
+        self.out_token_indices = torch.full(
+            (num_total_tokens,), TokenType.EMPTY.value, dtype=torch.int
+        )
+        self.out_token_types = torch.full(
+            (num_total_tokens,), TokenType.EMPTY.value, dtype=torch.int
+        )
+        self.in_token_indices = torch.full(
+            (num_total_tokens,), TokenType.EMPTY.value, dtype=torch.int
+        )
+        self.in_token_types = torch.full(
+            (num_total_tokens,), TokenType.EMPTY.value, dtype=torch.int
+        )
+
+        for idx, (in_token, out_token) in enumerate(token_map.items()):
+            match out_token.token_type():
+                case TokenType.IMAGE:
+                    self.out_token_indices[idx] = out_token.image_index(width)
+                    self.out_token_types[idx] = out_token.token_type().value
+                case TokenType.EMPTY:
+                    self.out_token_indices[idx] = TokenType.EMPTY.value
+                    self.out_token_types[idx] = TokenType.EMPTY.value
+                case TokenType.CONDITION | TokenType.LEARNED:
+                    assert False, (
+                        "Condition or learnable token should not be in output token map"
+                    )
+
+            in_token_type = in_token.token_type()
+            match in_token_type:
+                case TokenType.IMAGE | TokenType.LEARNED:
+                    self.in_token_indices[idx] = in_token.image_index(width)
+                    self.in_token_types[idx] = in_token_type.value
+                case TokenType.EMPTY:
+                    self.in_token_indices[idx] = TokenType.EMPTY.value
+                    self.in_token_types[idx] = TokenType.EMPTY.value
+                case TokenType.CONDITION:
+                    self.in_token_indices[idx] = in_token.cond_index
+                    self.in_token_types[idx] = in_token_type.value
+
+
+@dataclass(frozen=True)
+class AutoRegressiveStructure:
+    token_map: TokenMap
+    token_map_tensors: TokenMapTensors_v2
+    
+    cond_len: int
+    total_len: int
+    attention_mask: torch.Tensor | None = None
+
+
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
+    def assemble_input_tokens(
+        self,
+        image_tokens: Float[torch.Tensor, "batch_size image_len embed_dim"],
+        cond_tokens: Float[torch.Tensor, "batch_size cond_len embed_dim"],
+        learnable_token: Float[torch.Tensor, "embed_dim"],
+        freqs_cis: Float[torch.Tensor, "total_len _ 2"],
+        device: torch.device | None = None,
+    ):
+        if device is None:
+            device = image_tokens.device
+
+        batch_size, _, _ = image_tokens.shape
+        num_total_tokens = self.token_map_tensors.out_token_indices.shape[0]
+        embed_dim = image_tokens.shape[-1]
+
+        input_tokens = torch.zeros(
+            batch_size, num_total_tokens, embed_dim, device=device
+        )
+
+        image_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        learned_mask = self.token_map_tensors.in_token_types == TokenType.LEARNED.value
+        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+
+        image_indices = self.token_map_tensors.in_token_indices[image_mask]
+        reordered_image_tokens = image_tokens[:, image_indices, :]
+
+        input_tokens[:, image_mask, :] = reordered_image_tokens
+        input_tokens[:, learned_mask, :] = learnable_token
+        input_tokens[:, cond_mask, :] = cond_tokens
+
+        freqs_cis[~cond_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[~cond_mask]
+        ]
+
+        return input_tokens, freqs_cis
+
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
+    def assemble_positional_embedding(
+        self,
+        freqs_cis: Float[torch.Tensor, "total_len _ 2"],
+    ):
+        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+        freqs_cis[~cond_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[~cond_mask]
+        ]
+        
+        return freqs_cis
+    
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
+    def assemble_target_tokens(
+        self,
+        image_token_idx: Int64[torch.Tensor, "batch_size image_len"],
+        device: torch.device | None = None,
+    ):
+        if device is None:
+            device = image_token_idx.device
+
+        batch_size, _ = image_token_idx.shape
+        num_total_tokens = self.token_map_tensors.out_token_indices.shape[0]
+
+        target_tokens = torch.zeros(
+            batch_size, num_total_tokens, dtype=torch.int64, device=device
+        )
+        target_mask = torch.zeros(
+            batch_size, num_total_tokens, dtype=torch.bool, device=device
+        )
+
+        image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
+        empty_mask = self.token_map_tensors.out_token_types == TokenType.EMPTY.value
+        assert (image_mask.int() + empty_mask.int() == 1).all(), (
+            "Image and empty mask should be mutually exclusive"
+        )
+        reordered_image_token_idx = image_token_idx[
+            :, self.token_map_tensors.out_token_indices[image_mask]
+        ]
+
+        target_tokens[:, image_mask] = reordered_image_token_idx
+        target_mask[:, image_mask] = True
+
+        return target_tokens, target_mask
+
+    def assemble_input_tokens_for_decoding(
+        self,
+        image_tokens: Float[torch.Tensor, "batch_size image_len embed_dim"],
+        cond_tokens: Float[torch.Tensor, "batch_size cond_len embed_dim"],
+        learnable_token: Float[torch.Tensor, "embed_dim"],
+        freqs_cis: Float[torch.Tensor, "total_len _ 2"],
+        device: torch.device | None = None,
+    ):
+        if device is None:
+            device = image_tokens.device
+
+        batch_size, _, _ = image_tokens.shape
+        num_total_tokens = self.token_map_tensors.out_token_indices.shape[0]
+        embed_dim = image_tokens.shape[-1]
+
+        input_tokens = torch.zeros(
+            batch_size, num_total_tokens, embed_dim, device=device
+        )
+        image_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        learned_mask = self.token_map_tensors.in_token_types == TokenType.LEARNED.value
+        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+
+        image_indices = self.token_map_tensors.in_token_indices[image_mask]
+        reordered_image_tokens = image_tokens[:, image_indices, :]
+
+        input_tokens[:, image_mask, :] = reordered_image_tokens
+        input_tokens[:, learned_mask, :] = learnable_token
+        input_tokens[:, cond_mask, :] = cond_tokens
+
+        freqs_cis[~cond_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[~cond_mask]
+        ]
+
+        return input_tokens, freqs_cis
+    
+    def fastest_decoding_schedule(self):
+        # the decoding schedule dependent on the token map
+        # which several output tokens can be generated at once
+        # this will require the output token to not dependent on the input token that has not been generated yet
+
+        total_len = len(self.token_map.keys())
+        list_input_tokens = list(self.token_map.keys())
+        list_output_tokens = list(self.token_map.values())
+        
+        prev_output_tokens: set[Token] = {EmptyToken()}
+        parallel_decoding_groups= []
+        
+        start = self.cond_len - 1
+        end = self.cond_len
+        tmp_parallel_decoding_idx = [start]
+        while end < len(self.token_map):
+            if list_input_tokens[end] in prev_output_tokens or list_input_tokens[end].token_type() == TokenType.LEARNED:
+                tmp_parallel_decoding_idx.append(end)
+                end += 1
+            else:
+                parallel_decoding_groups.append(tmp_parallel_decoding_idx)
+                prev_output_tokens.update({list_output_tokens[idx] for idx in range(start, end)})
+                start = end
+                end = start + 1
+                tmp_parallel_decoding_idx = [start]
+                
+        parallel_decoding_groups.append(tmp_parallel_decoding_idx)
+        return parallel_decoding_groups
+    
+    def get_training_attention_mask(self, parallel_decoding_groups: list[list[int]]):
+
+        attention_mask = torch.zeros(self.total_len, self.total_len, dtype=torch.bool)
+        attention_mask[:self.cond_len, :self.cond_len] = torch.tril(torch.ones(self.cond_len, self.cond_len, dtype=torch.bool))
+        prev_decoded_idx = list(range(0, self.cond_len-1))
+        for idx in range(len(parallel_decoding_groups)):
+            prev_decoded_idx.extend(parallel_decoding_groups[idx])
+            
+            rows, cols  = torch.meshgrid(
+                torch.tensor(parallel_decoding_groups[idx]), torch.tensor(prev_decoded_idx), indexing="ij"
+            )
+            attention_mask[rows, cols] = 1
+
+        return attention_mask
+    
+    
+@dataclass
 class ShiftPattern:
     x_shift: int
     y_shift: int
@@ -268,137 +550,116 @@ def _get_image_token_index_map(
     return map, input_token_groups
 
 
-def _test_attention_mask(attention_mask, input_token_groups, first_adam_mask, cond_len):
-    num_first_pass_tokens = first_adam_mask.int().sum()
-    for input_ind in range(attention_mask.shape[0]):
-        if input_ind < cond_len + num_first_pass_tokens - 1:
-            assert attention_mask[input_ind][input_ind]
-            assert not attention_mask[input_ind][input_ind + 1]
-        else:
-            assert attention_mask[input_ind].int().sum()
-
-    expansion_steps = [1 for _ in range(cond_len + num_first_pass_tokens - 2)] + [
-        len(g) for g in input_token_groups
-    ]
-    step_index = 0
-    # check if the attention mask expands from left to right
-    prev = attention_mask[0]
-    prev_ones = sum(prev)
-    for curr in attention_mask[1:]:
-        for p, c in zip(prev, curr):
-            if p == 1 and c == 0:
-                assert False
-
-        curr_ones = sum(curr)
-        step = curr_ones - prev_ones
-        if step == 0:
-            prev = curr
-            continue
-
-        if step_index >= len(expansion_steps) or step != expansion_steps[step_index]:
-            assert False
-
-        # Move to next expected step
-        step_index += 1
-        prev = curr
-        prev_ones = curr_ones
-
-
-def _test_index_map(
-    index_map: OrderedDict[TOKEN_MAP_KEY_TYPE, list[int]],
-    adam_masks: list[torch.Tensor],
-    height: int,
+def _get_image_token_index_map_v2(
     width: int,
-):
-    # check expected num input tokens
-    num_input_tokens = 0
-    num_masks = len(adam_masks)
-    for i in range(num_masks - 1):
-        num_gen_tokens = adam_masks[i].int().sum()
-        if i == 0:
-            num_input_tokens += 2 * num_gen_tokens - 1
+    height: int,
+    cond_len: int,
+    masked_coords: list[torch.Tensor],
+) -> AutoRegressiveStructure:
+    total_len = width * height + cond_len
+    attention_mask = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool))
+
+    token_map: TokenMap = TokenMap()
+    first_pass_coords = masked_coords[0].tolist()
+    first_image_token = ImageToken(
+        x_coord=first_pass_coords[0][0], y_coord=first_pass_coords[0][1]
+    )
+    attention_mask[
+        cond_len + len(first_pass_coords) :, cond_len + len(first_pass_coords) :
+    ] = 0
+
+    bi_attention_size = total_len - cond_len - len(first_pass_coords)
+    num_generated_tokens_per_pass = [len(coords) for coords in masked_coords[1:]]
+    assert sum(num_generated_tokens_per_pass) == bi_attention_size
+    bi_attention_mask = torch.zeros(
+        (bi_attention_size, bi_attention_size), dtype=torch.bool
+    )
+
+    num_prev_tokens = 0
+    for num in num_generated_tokens_per_pass:
+        num_prev_tokens += num
+        bi_attention_mask[num_prev_tokens - num : num_prev_tokens, :num_prev_tokens] = 1
+
+    # prepare attention mask
+    attention_mask[
+        cond_len + len(first_pass_coords) :, cond_len + len(first_pass_coords) :
+    ] = bi_attention_mask
+
+    # add condition tokens
+    for i in range(cond_len):
+        cond_token = ConditionToken(cond_index=i)
+        if i == cond_len - 1:
+            token_map[cond_token] = first_image_token
         else:
-            num_input_tokens += num_gen_tokens
-    assert len(index_map) == num_input_tokens
+            token_map[cond_token] = EmptyToken()
 
-    # check expeceted num output tokens
-    output_token_indices = [
-        item
-        for sublist in list(index_map.values())
-        if sublist is not None
-        for item in sublist
-    ]
-    assert len(output_token_indices) == height * width - 1
-    assert len(set(output_token_indices)) == len(output_token_indices)
+    # autoregressive first pass
+    for idx in range(len(first_pass_coords) - 1):
+        curr_coords = first_pass_coords[idx]
+        next_coords = first_pass_coords[idx + 1]
 
-    image = torch.zeros((height, width), dtype=torch.int)
-    gt_image = torch.ones_like(image)
-    gt_image[0, 0] = 0
-    for i in output_token_indices:
-        x = (i) % width
-        y = (i) // width
-        image[y, x] = 1
-    assert (image == gt_image).all()
+        curr_x, curr_y = curr_coords
+        next_x, next_y = next_coords
 
+        curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
+        next_img_token = ImageToken(x_coord=next_x, y_coord=next_y)
+        token_map[curr_img_token] = next_img_token
 
-def _test_input_token_groups(
-    input_token_groups, width: int, height: int, base_block_size: int
-):
-    flattened = []
-    num_base_blocks = (width * height) // (base_block_size**2)
-    for idx, input_token_group in enumerate(input_token_groups):
-        flattened.extend(input_token_group)
-        if idx == 0 or idx == 1:
-            assert len(input_token_group) == num_base_blocks
+        if idx == len(first_pass_coords) - 2:
+            last_img_token = next_img_token
+            token_map[last_img_token] = EmptyToken()
+
+    # passes with learnable tokens
+    for i_pass in range(1, len(masked_coords)):
+        curr_coords = masked_coords[i_pass].tolist()
+        if i_pass == 1:
+            # learnable token
+            for idx, coord in enumerate(curr_coords):
+                x, y = coord
+                learnable_token = LearnedToken(x_coord=x, y_coord=y)
+                pred_img_token = ImageToken(x_coord=x, y_coord=y)
+                token_map[learnable_token] = pred_img_token
+                # input_token_group.append(curr_img_token)
         else:
-            assert len(input_token_group) == num_base_blocks * (2 ** (idx - 1))
+            previous_coords = masked_coords[i_pass - 1].tolist()
+            prev_coord_len = len(previous_coords)
+            assert prev_coord_len == len(curr_coords) // 2
+            for prev_coord, curr_coord in zip(
+                previous_coords, curr_coords[:prev_coord_len]
+            ):
+                prev_x, prev_y = prev_coord
+                curr_x, curr_y = curr_coord
+                prev_img_token = ImageToken(x_coord=prev_x, y_coord=prev_y)
+                curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
 
-    assert all(flattened[i] + 1 == flattened[i + 1] for i in range(len(flattened) - 1))
-    assert flattened[0] == num_base_blocks - 1
+                token_map[prev_img_token] = curr_img_token
 
+            for curr_coord in curr_coords[prev_coord_len:]:
+                x, y = curr_coord
+                learnable_token = LearnedToken(x_coord=x, y_coord=y)
+                token_map[learnable_token] = ImageToken(x_coord=x, y_coord=y)
 
-def test_adam_utils_consistency():
-    width = 32
-    height = 32
-    base_block_size = 16
-    cond_len = 1
-
-    adam_masks, masked_coords, shift_patterns = _generalized_adam_interlacing(
-        width, height, base_block_size
+    token_map_tensors = TokenMapTensors_v2(token_map, width, height)
+    return AutoRegressiveStructure(
+        token_map=token_map,
+        token_map_tensors=token_map_tensors,
+        cond_len=cond_len,
+        total_len=total_len,
+        attention_mask=attention_mask,
     )
-    index_map, input_token_groups = _get_image_token_index_map(
-        width, height, masked_coords, shift_patterns
+
+
+def get_autoregressive_structure(
+    width: int,
+    height: int,
+    base_block_size: int,
+    cond_len: int,
+) -> AutoRegressiveStructure:
+    _, masked_coords, _ = _generalized_adam_interlacing(width, height, base_block_size)
+    ar_structure = _get_image_token_index_map_v2(
+        width,
+        height,
+        cond_len,
+        masked_coords,
     )
-    attention_mask = _get_adam_attention_mask(
-        adam_masks[0], cond_len, index_map, input_token_groups
-    )
-
-    _test_index_map(index_map, adam_masks, height, width)
-    _test_input_token_groups(input_token_groups, width, height, base_block_size)
-    _test_attention_mask(attention_mask, input_token_groups, adam_masks[0], cond_len)
-    visualize_adam_masks(adam_masks, f"adam_mask_block_size_{base_block_size}.png")
-
-
-def visualize_adam_masks(masks: list[torch.Tensor], filename: str | pathlib.Path):
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, len(masks), figsize=(3 * len(masks), 3))
-    for i, mask in enumerate(masks):
-        axes[i].imshow(mask.cpu(), cmap="gray", interpolation="none")
-        axes[i].set_title(f"Pass {i + 1}")
-        axes[i].axis("off")
-    plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-
-
-if __name__ == "__main__":
-    # width, height = 16, 16
-    # base_block_size = 8
-    # cond_len = 2
-    # masks, _, _ = _generalized_adam_interlacing(width, height, base_block_size)
-    # attention_mask = _get_attention_mask_from_adam(cond_len, masks)
-    # test_attention_mask(cond_len, attention_mask, masks)
-    # get_output_pred_index_map(width, height, base_block_size, cond_len)
-    # test_index_map()
-    test_adam_utils_consistency()
+    return ar_structure

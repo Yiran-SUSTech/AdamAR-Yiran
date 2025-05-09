@@ -80,7 +80,10 @@
                 "--image-size", "384", 
                 "--gpt-model", "GPT-B",
                 "--global-batch-size", "4",
-                "--no-compile"
+                "--no-compile",
+                "--ckpt-every", "1000",
+                // "--gpt-ckpt", "./results/010-GPT-B/checkpoints/0001000.pt",
+                // "--num-datapoints", "10",
             ],
             "justMyCode": false
         },
@@ -96,8 +99,9 @@
             },
             "args": [
                 "--vq-ckpt", "./pretrained_models/vq_ds16_c2i.pt",
-                "--gpt-ckpt", "./pretrained_models/c2i_L_384.pt",
-                "--gpt-model", "GPT-L",
+                // "--gpt-ckpt", "./pretrained_models/c2i_L_384.pt",
+                "--gpt-ckpt",  "./results/001-GPT-B/checkpoints/0001000.pt",
+                "--gpt-model", "GPT-B",
                 "--image-size", "384",
             ],
             "justMyCode": false
