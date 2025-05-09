@@ -149,7 +149,7 @@ def main(args):
 
     # Prepare models for training:
     if args.gpt_ckpt:
-        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
@@ -299,5 +299,6 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     args = parser.parse_args()
     main(args)

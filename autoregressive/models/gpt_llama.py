@@ -13,8 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
-from autoregressive.models.utils import TokenType, get_autoregressive_structure
-from autoregressive.models.generate import sample
+
 
 def find_multiple(n: int, k: int):
     if n % k == 0:
@@ -49,8 +48,6 @@ class ModelArgs:
     block_size: int = 256
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    
-    adam_block_size: int = 8
 
 
 #################################################################################
@@ -270,7 +267,6 @@ class Transformer(nn.Module):
         self.num_classes = config.num_classes
         self.model_type = config.model_type
         self.cls_token_num = config.cls_token_num
-        self.adam_block_size = config.adam_block_size
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
@@ -280,13 +276,6 @@ class Transformer(nn.Module):
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.tok_dropout = nn.Dropout(config.token_dropout_p)
 
-        # auxiliary autoregressive training/generation structure
-        width = int(config.block_size ** 0.5)
-        height = width
-        self.auto_regr_struct = get_autoregressive_structure(width=width, height=height, base_block_size=config.adam_block_size, cond_len=config.cls_token_num)
-        self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
-        
-        
         # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
@@ -346,157 +335,58 @@ class Transformer(nn.Module):
         cond_idx: torch.Tensor,  # cond_idx_or_embed
         input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
-        valid: Optional[torch.Tensor] = None,
-        ):
-        if idx is not None and cond_idx is not None:
-            return self.forward_train(idx, cond_idx, input_pos, targets, valid)
-        else:
-            raise ValueError("idx and cond_idx cannot be both None")
-
-    def forward_inference(self, 
-                          x: torch.Tensor, 
-                          freqs_cis: torch.Tensor, 
-                          input_pos: torch.Tensor):
-        """ Args:
-            x: [bs, query_num, dim] Input tokens
-            freqs_cis: [bs, query_num, n_head, dim // n_head] Frequency embeddings
-            input_pos: [query_num] Position index for each token
-        """
-
-        # TODO: add support for KV cache using input_pos 
-        
-        assert self.auto_regr_struct.attention_mask is not None
-        mask = self.auto_regr_struct.attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
-        h = x
-        for layer in self.layers:
-            h = layer(h, freqs_cis, start_pos=None, mask=mask)
-        h = self.norm(h)
-        logits = self.output(h).float()
-        return logits
-
-    def forward_train(
-        self, 
-        idx: torch.Tensor, 
-        cond_idx: torch.Tensor,  # cond_idx_or_embed
-        input_pos:  Optional[torch.Tensor] = None, 
-        targets: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
     ):
-        assert targets is None
-        cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
-        token_embeddings = self.tok_embeddings(idx)
-        assem_input_embeddings, assem_freqs_cis = self.auto_regr_struct.assemble_input_tokens(token_embeddings, cond_embeddings, self.learnable_pos_embedding, self.freqs_cis.to(idx.device))
-
-        h = self.tok_dropout(assem_input_embeddings)
+        if idx is not None and cond_idx is not None: # training or naive inference
+            cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
+            token_embeddings = self.tok_embeddings(idx)
+            token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
+            h = self.tok_dropout(token_embeddings)
+            self.freqs_cis = self.freqs_cis.to(h.device)
+        else:
+            if cond_idx is not None: # prefill in inference
+                token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
+            else: # decode_n_tokens(kv cache) in inference
+                token_embeddings = self.tok_embeddings(idx)
+            
+            bs = token_embeddings.shape[0]
+            mask = self.causal_mask[:bs, None, input_pos]
+            h = self.tok_dropout(token_embeddings)
+            self.freqs_cis = self.freqs_cis
         
-        assert self.auto_regr_struct.attention_mask is not None
-
+        if self.training:
+            freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
+        else:
+            freqs_cis = self.freqs_cis[input_pos]
+        # transformer blocks
         for layer in self.layers:
-            h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.attention_mask.to(h.device))
+            h = layer(h, freqs_cis, input_pos, mask)
         
+        # output layers
         h = self.norm(h)
         logits = self.output(h).float()
-        targets, valid = self.auto_regr_struct.assemble_target_tokens(image_token_idx=idx) 
+        
+        if self.training:
+            logits = logits[:, self.cls_token_num - 1:].contiguous()
+
         # if we are given some desired targets also calculate the loss
         loss = None
         if valid is not None:
-            loss_all = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none"
-            )
-            valid_all = valid.view(-1) # valid[:, None].repeat(1, targets.shape[1]).view(-1)
+            loss_all = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
+            valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
 
+
     def get_fsdp_wrap_module_list(self) -> List[nn.Module]:
         return list(self.layers)
 
-    @torch.no_grad()
-    def generate(self,
-                 cond_idx: torch.Tensor,
-                 cfg_scales: tuple[float, float] = (1.0, 1.0),
-                 num_inference_steps: int = 88,
-                 temperature: float = 1.0,
-                 top_k: int = 0,
-                 top_p: float = 1.0):
-        
-        self.freqs_cis = self.freqs_cis.to(cond_idx.device)
-        assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
-        bs = cond_idx.shape[0]        
-        decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
-        if cfg_scales[-1] > 1.0:
-            cond_null = torch.ones_like(cond_idx) * self.num_classes
-            cond_combined = torch.cat([cond_idx, cond_null])
-            bs *= 2
-        else:
-            cond_combined = cond_idx
-    
-        cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
-        x = torch.empty([bs, 0, self.config.dim], device=cond_idx.device, dtype=cond_combined_tokens.dtype)
-        input_pos = torch.empty(0, device=cond_idx.device, dtype=torch.long)
-            
-        # TODO: add support for KV cache (below code is from RandAR)
-        # Step-4: KV Cache setup
-        # max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
-        # with torch.device(cond.device):
-        #     self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
-        
-        input_token_config = list(self.auto_regr_struct.token_map.keys())
-        output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.values())}
-        
-        decoding_schedule = self.auto_regr_struct.fastest_decoding_schedule()
-        for decoding_step in range(len(decoding_schedule)):
-            next_decoded_token_group = decoding_schedule[decoding_step]
-            next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
-            for idx, next_decoded_token_idx in enumerate(next_decoded_token_group):
-                input_token = input_token_config[next_decoded_token_idx]
-                input_token_type = input_token.token_type()
-                match input_token_type:
-                    case TokenType.IMAGE:
-                        tmp = output_token_config[input_token]
-                        next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
-                    case TokenType.LEARNED:
-                        next_embeddings[:, idx, :]  = self.learnable_pos_embedding[None, None]
-                    case TokenType.CONDITION:
-                        next_embeddings[:, idx, :] = cond_combined_tokens[:, input_token.cond_index, :]
-                    case _:
-                        assert False, f"Invalid token type {input_token_type}"     
-                                                              
-            if cfg_scales[-1] > 1.0:
-                next_embeddings = torch.cat([next_embeddings, next_embeddings], dim=0)
 
-            x = torch.cat([x, next_embeddings], dim=1)
-            input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
-            freqs_cis = assembled_freq_cis[input_pos]
-        
-            assert x.shape[1] == freqs_cis.shape[0]
 
-            decoded_token_group = decoding_schedule[decoding_step]
-            num_decoded_tokens = len(decoded_token_group)
-            query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
-            logits = self.forward_inference(x, freqs_cis, input_pos)
-            if cfg_scales[-1] > 1.0:
-                cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
-                cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
-                logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
-
-            logits = logits[:, -num_decoded_tokens:] # [bs, query_num, vocab_size]
-            indices = torch.zeros(decoded_indices.shape[0], num_decoded_tokens, dtype=torch.long, device=x.device)
-            for i in range(num_decoded_tokens):
-                indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
-
-            for idx, decoded_token_idx in enumerate(decoded_token_group):
-                decoded_indices[:, decoded_token_idx] = indices[:, idx]
-            
-        
-        image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
-        decoded_indices = decoded_indices[:, image_mask]
-        _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
-        final_decoded_indices = decoded_indices[:, back_order]
-        return final_decoded_indices
-            
 #################################################################################
 #                      Rotary Positional Embedding Functions                    #
 #################################################################################

@@ -139,6 +139,7 @@ def test_adam_utils_consistency():
         image_tokens, cond_tokens, learnable_token, freqs_cis
     )
     target_token_idx, target_mask = ar_structure.assemble_target_tokens(image_token_idx)
+    decoding_schedule = ar_structure.fastest_decoding_schedule()
 
     attention_mask = _get_adam_attention_mask(
         adam_masks[0], cond_len, index_map, input_token_groups
