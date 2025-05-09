@@ -290,9 +290,6 @@ class AutoRegressiveStructure:
             )
             attention_mask[rows, cols] = 1
 
-        # torchvision.utils.save_image(
-        #         (self.attention_mask == attention_mask).float(), "attention_test.png",
-        # )
         return attention_mask
     
     
