@@ -131,7 +131,7 @@ class AutoRegressiveStructure:
     attention_mask: torch.Tensor | None = None
 
 
-    @jaxtyped(typechecker=typechecker)
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_input_tokens(
         self,
         image_tokens: Float[torch.Tensor, "batch_size image_len embed_dim"],
@@ -168,7 +168,7 @@ class AutoRegressiveStructure:
 
         return input_tokens, freqs_cis
 
-    @jaxtyped(typechecker=typechecker)
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_positional_embedding(
         self,
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
@@ -180,7 +180,7 @@ class AutoRegressiveStructure:
         
         return freqs_cis
     
-    @jaxtyped(typechecker=typechecker)
+    # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_target_tokens(
         self,
         image_token_idx: Int64[torch.Tensor, "batch_size image_len"],
