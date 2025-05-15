@@ -1,13 +1,16 @@
 import math
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
+from collections import defaultdict
 
+from matplotlib.backend_bases import CloseEvent
 import torch
 from beartype import beartype as typechecker
 from jaxtyping import Float, Int, Int64, jaxtyped
+
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 TOKEN_MAP_KEY_TYPE = str | int
@@ -47,6 +50,16 @@ class SpatialToken(Token):
         return self.y_coord * image_width + self.x_coord
 
 
+def spatial_token_distance(token: SpatialToken, other: SpatialToken, type: str="manhattan") -> float:
+    match type.lower(): 
+        case "manhattan":
+            return abs(token.x_coord - other.x_coord) + abs(token.y_coord - other.y_coord)
+        case "euclidean":
+            return math.sqrt((token.x_coord - other.x_coord) ** 2 + (token.y_coord - other.y_coord) ** 2)
+        case _:
+            raise ValueError(f"Unknown distance type: {type}")
+        
+    
 @dataclass(frozen=True)
 class LearnedToken(SpatialToken):
     def token_type(self):
@@ -66,9 +79,43 @@ class ConditionToken(Token):
     def token_type(self):
         return TokenType.CONDITION
 
+@dataclass
+class TokenMap:
+    _data: list[tuple[Token, Token]] = field(default_factory=list)
+    _index: dict[Token, list[int]] = field(default_factory=lambda: defaultdict(list))
+        
+    def __len__(self):
+        return len(self._data)
 
-TokenMap = OrderedDict[Token, Token]
+    def __setitem__(self, in_token: Token, out_token: Token):
+        self._data.append((in_token, out_token))
+        self._index[in_token].append(len(self._data) - 1)
+        
+    def __getitem__(self, key: int | tuple[int, int]):
+        match key:
+            case int():
+                return self._data[key]
+            case Token():
+                # Return all matches for the given in_token
+                indices = self._index.get(key, [])
+                return [self._data[i] for i in indices]
+            case (x, y):
+                learned_indices = self._index.get(LearnedToken(x, y), [])
+                image_indices = self._index.get(ImageToken(x, y), [])
+                indices = learned_indices + image_indices
+                return [self._data[i] for i in indices]
+            case _:
+                raise KeyError(f"Key {key} not found in TokenMap")
 
+    def input_tokens(self):
+        return (in_token for in_token, _ in self._data)
+    
+    def output_tokens(self):
+        return (out_token for _, out_token in self._data)
+
+    @property
+    def data(self):
+        return tuple(self._data)
 
 @dataclass
 class TokenMapTensors_v2:
@@ -95,7 +142,7 @@ class TokenMapTensors_v2:
             (num_total_tokens,), TokenType.EMPTY.value, dtype=torch.int
         )
 
-        for idx, (in_token, out_token) in enumerate(token_map.items()):
+        for idx, (in_token, out_token) in enumerate(token_map):
             match out_token.token_type():
                 case TokenType.IMAGE:
                     self.out_token_indices[idx] = out_token.image_index(width)
@@ -175,9 +222,8 @@ class AutoRegressiveStructure:
     ):
         cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
         freqs_cis[~cond_mask] = freqs_cis[
-            self.token_map_tensors.in_token_indices[~cond_mask]
+            self.token_map_tensors.out_token_indices[~cond_mask]
         ]
-        
         return freqs_cis
     
     # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
@@ -253,9 +299,10 @@ class AutoRegressiveStructure:
         # which several output tokens can be generated at once
         # this will require the output token to not dependent on the input token that has not been generated yet
 
-        total_len = len(self.token_map.keys())
-        list_input_tokens = list(self.token_map.keys())
-        list_output_tokens = list(self.token_map.values())
+        list_input_tokens = list(self.token_map.input_tokens())
+        list_output_tokens = list(self.token_map.output_tokens())
+        
+        total_len = len(list_input_tokens)
         
         prev_output_tokens: set[Token] = {EmptyToken()}
         parallel_decoding_groups= []
@@ -550,6 +597,32 @@ def _get_image_token_index_map(
     return map, input_token_groups
 
 
+def _find_closest_token(
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    min_dist = float("inf")
+    closest_token = None
+    closest_index = float("inf")
+
+    for token in candidate_tokens:
+        dist = spatial_token_distance(query_token, token)
+        index = query_token.image_index(image_width)
+
+        if dist < min_dist or (dist == min_dist and index < closest_index):
+            min_dist = dist
+            closest_token = token
+            closest_index = index
+
+    assert closest_token is not None, "No closest token found"
+    return closest_token
+
+    
 def _get_image_token_index_map_v2(
     width: int,
     height: int,
@@ -621,9 +694,19 @@ def _get_image_token_index_map_v2(
                 token_map[learnable_token] = pred_img_token
                 # input_token_group.append(curr_img_token)
         else:
-            previous_coords = masked_coords[i_pass - 1].tolist()
-            prev_coord_len = len(previous_coords)
-            assert prev_coord_len == len(curr_coords) // 2
+            # previous_coords = masked_coords[i_pass - 1].tolist()
+            # prev_coord_len = len(previous_coords)
+            # assert prev_coord_len == len(curr_coords) // 2
+            generated_tokens = list(t for t in token_map.output_tokens() if t.token_type() == TokenType.IMAGE)
+            for curr_coord in curr_coords:
+                x, y = curr_coord
+                curr_img_token = ImageToken(x_coord=x, y_coord=y)
+                closest_token = _find_closest_token(
+                    curr_img_token, generated_tokens, width
+                )
+                token_map[closest_token] = curr_img_token
+                
+            '''
             for prev_coord, curr_coord in zip(
                 previous_coords, curr_coords[:prev_coord_len]
             ):
@@ -638,6 +721,7 @@ def _get_image_token_index_map_v2(
                 x, y = curr_coord
                 learnable_token = LearnedToken(x_coord=x, y_coord=y)
                 token_map[learnable_token] = ImageToken(x_coord=x, y_coord=y)
+            '''
 
     token_map_tensors = TokenMapTensors_v2(token_map, width, height)
     return AutoRegressiveStructure(

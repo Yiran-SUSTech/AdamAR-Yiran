@@ -11,6 +11,7 @@ from autoregressive.models.utils import (
     _get_image_token_index_map,
     _get_image_token_index_map_v2,
 )
+from autoregressive.models.vis_utils import visualize_token_map
 
 
 def _test_attention_mask(attention_mask, input_token_groups, first_adam_mask, cond_len):
@@ -138,9 +139,11 @@ def test_adam_utils_consistency():
     input_tokens = ar_structure.assemble_input_tokens(
         image_tokens, cond_tokens, learnable_token, freqs_cis
     )
+    visualize_token_map(ar_structure.token_map, width=width, height=height, cond_len=cond_len)
+    
     target_token_idx, target_mask = ar_structure.assemble_target_tokens(image_token_idx)
     decoding_schedule = ar_structure.fastest_decoding_schedule()
-
+    
     attention_mask = _get_adam_attention_mask(
         adam_masks[0], cond_len, index_map, input_token_groups
     )
