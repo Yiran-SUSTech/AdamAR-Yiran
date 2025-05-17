@@ -2,20 +2,35 @@ import token
 from tokenize import Token
 from typing import OrderedDict
 
-from sympy import O
 from autoregressive.models.utils import TokenMap, TokenMapTensors_v2, TokenType
 import matplotlib.pyplot as plt
 import torch
 import matplotlib.colors as mcolors
 
+
+def to_xy(index: int, width: int):
+    y = index // width
+    x = index % width
+    return x, y
+
+def generate_colors(n):
+    cmap = plt.get_cmap('hsv')
+    return [cmap(i / n) for i in range(n)]
+
 def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
                         width: int,
                         height: int,
-                        cond_len: int):
+                        cond_len: int,
+                        decoding_schedule: list[list[int]] | None = None):
     
+
     if isinstance(token_map, TokenMap):
         token_map = TokenMapTensors_v2(token_map, width, height)
     
+    if decoding_schedule is not None:
+        num_decoding_step = len(decoding_schedule)
+        colors = generate_colors(num_decoding_step)
+        
     image_len = width * height
     output_image_mask = (token_map.out_token_types == TokenType.IMAGE.value)
     output_indices = token_map.out_token_indices[output_image_mask]
@@ -23,16 +38,39 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
     vis_map_indices = torch.zeros(image_len, dtype=torch.int)
     vis_map_type = torch.zeros(image_len, dtype=torch.int)
     
-    vis_map_indices[output_indices] = token_map.in_token_indices[output_image_mask]
+    vis_map_indices[output_indices] = token_map.in_token_indices[output_image_mask]    
     vis_map_type[output_indices] = token_map.in_token_types[output_image_mask] + torch.iinfo(torch.int).min
 
+    if decoding_schedule is not None:
+        for step, decoded_indices in enumerate(decoding_schedule):
+            plt.figure()
+            plt.imshow(vis_map_indices.reshape((height, width)), cmap='gray')
+            plt.title(f"Token Map Indices at step {step}")
+            plt.colorbar()
 
-    plt.figure()
-    plt.imshow(vis_map_indices.reshape((height, width)), cmap='gray')
-    plt.title("Token Map Indices")
-    plt.colorbar()
-    plt.savefig("token_map_indices.png")
-    plt.close()
+            # if step == 4:
+            #     print("stop")
+
+            for i in decoded_indices:
+                if not output_image_mask[i]:
+                    continue
+
+                out_idx = token_map.out_token_indices[i].item()
+                in_idx = token_map.in_token_indices[i].item()
+
+                out_x, out_y = to_xy(out_idx, width)
+                in_x, in_y = to_xy(in_idx, width)
+
+                # Draw arrow from input to output
+                dx = out_x - in_x
+                dy = out_y - in_y
+
+                if step == 4:
+                    print(f"Step {step}: Drawing arrow from ({in_x}, {in_y}) to ({out_x}, {out_y})")
+                plt.arrow(in_x, in_y, dx, dy, color='red', head_width=0.5, length_includes_head=True, alpha=0.7)
+
+            plt.savefig(f"step_{step}.jpg")
+            plt.close()
 
 
     cmap = mcolors.ListedColormap(['lightgray', 'steelblue', 'salmon'])
