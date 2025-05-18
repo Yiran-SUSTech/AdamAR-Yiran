@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import torch
 import matplotlib.colors as mcolors
 
-
 def to_xy(index: int, width: int):
     y = index // width
     x = index % width
@@ -45,11 +44,8 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
         for step, decoded_indices in enumerate(decoding_schedule):
             plt.figure()
             plt.imshow(vis_map_indices.reshape((height, width)), cmap='gray')
-            plt.title(f"Token Map Indices at step {step}")
+            plt.title(f"Token map at step {step}")
             plt.colorbar()
-
-            # if step == 4:
-            #     print("stop")
 
             for i in decoded_indices:
                 if not output_image_mask[i]:
@@ -88,3 +84,48 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
     plt.title("Token Map Types")
     plt.savefig("token_map_types.png")
     plt.close()
+
+def visualize_attention_mask(attention_mask: torch.Tensor,
+                             token_map: TokenMap | TokenMapTensors_v2,
+                             decoding_schedule: list[list[int]] | None,
+                             height: int,
+                             width: int):
+
+    if isinstance(token_map, TokenMap):
+        token_map = TokenMapTensors_v2(token_map, width, height)
+        
+    image_len = width * height
+    
+    output_image_mask = (token_map.out_token_types == TokenType.IMAGE.value)
+    output_indices = token_map.out_token_indices[output_image_mask]
+
+    input_image_mask = (token_map.in_token_types == TokenType.IMAGE.value)
+    input_indices = token_map.in_token_indices[input_image_mask]
+    h, w = torch.meshgrid(output_indices, output_indices)
+    # attention_mask_no_cond = attention_mask[h, w]
+    
+    vis_map_indices = torch.zeros(image_len, dtype=torch.int)
+    vis_map_type = torch.zeros(image_len, dtype=torch.int)
+    
+    vis_map_indices[output_indices] = token_map.in_token_indices[output_image_mask]    
+    vis_map_type[output_indices] = token_map.in_token_types[output_image_mask] + torch.iinfo(torch.int).min
+
+    if decoding_schedule is not None:
+        for step, decoded_indices in enumerate(decoding_schedule):
+            plt.figure()
+            plt.title(f"Attention map {step}")
+
+            attended_mask = attention_mask[decoded_indices, :]
+            attended_image_mask = torch.any(attended_mask[:, input_image_mask], dim=0).int()
+            
+            vis_mask =  torch.zeros(image_len, dtype=torch.int32)
+            for i in range(len(attended_image_mask)):
+                if attended_image_mask[i]:
+                    vis_mask[input_indices[i]] =1
+ 
+            plt.imshow(vis_mask.reshape((height, width)), cmap='gray')
+            plt.colorbar()
+
+            plt.savefig(f"attention_step_{step}.jpg")
+            plt.close()
+

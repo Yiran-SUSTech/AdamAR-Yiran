@@ -339,16 +339,25 @@ class AutoRegressiveStructure:
             for i, tmp_coord in enumerate(tmp_coords):
                 x, y = tuple(tmp_coord)
                 x, y = x.item(), y.item()
-                output_token_index = self.token_map.get_output_token_index((ImageToken(x, y)))
+                output_token_index = self.token_map.get_output_token_index((ImageToken(x, y)))                    
                 if curr_max_decoded_idx < output_token_index:
                     curr_max_decoded_idx = output_token_index
                 else:
                     raise AssertionError(
                         f"Output token index {output_token_index} should be greater than previous max {curr_max_decoded_idx} in the autoregressive decoding schedule"
                     )
-                    
+                
                 decoded_group.append(output_token_index)
-            decoding_schedule.append(decoded_group)
+            
+            
+            # detect potential unused generated token between the generated image token groups
+            assert len(decoded_group) != 0
+            if len(decoding_schedule)!=0 and decoded_group[0] > decoding_schedule[-1][-1] + 1:
+                unused_start_idx = decoding_schedule[-1][-1] + 1
+                unused_end_idx = decoded_group[0]
+                decoding_schedule.append(list(range(unused_start_idx, unused_end_idx)) + decoded_group)
+            else:
+                decoding_schedule.append(decoded_group)
             
         return decoding_schedule
     

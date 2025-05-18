@@ -13,42 +13,22 @@ from autoregressive.models.utils import (
     adam_image_decoding_strategy,
     autoregressive_first_step,
 )
-from autoregressive.models.vis_utils import visualize_token_map
+from autoregressive.models.vis_utils import visualize_attention_mask, visualize_token_map
 
 
-def _test_attention_mask(attention_mask, input_token_groups, first_adam_mask, cond_len):
-    num_first_pass_tokens = first_adam_mask.int().sum()
-    for input_ind in range(attention_mask.shape[0]):
-        if input_ind < cond_len + num_first_pass_tokens - 1:
-            assert attention_mask[input_ind][input_ind]
-            assert not attention_mask[input_ind][input_ind + 1]
-        else:
-            assert attention_mask[input_ind].int().sum()
-
-    expansion_steps = [1 for _ in range(cond_len + num_first_pass_tokens - 2)] + [
-        len(g) for g in input_token_groups
-    ]
-    step_index = 0
+def _test_attention_mask(attention_mask, decoding_schedule):  
+    expansion_steps = [len(decoded_group) for decoded_group in decoding_schedule]
     # check if the attention mask expands from left to right
-    prev = attention_mask[0]
-    prev_ones = sum(prev)
-    for curr in attention_mask[1:]:
-        for p, c in zip(prev, curr):
-            if p == 1 and c == 0:
-                assert False
-
+    prev_ones = 0
+    step_index = 0 
+    for curr in attention_mask:
         curr_ones = sum(curr)
         step = curr_ones - prev_ones
         if step == 0:
-            prev = curr
             continue
-
         if step_index >= len(expansion_steps) or step != expansion_steps[step_index]:
             assert False
-
-        # Move to next expected step
         step_index += 1
-        prev = curr
         prev_ones = curr_ones
 
 
@@ -145,15 +125,18 @@ def test_adam_utils_consistency():
 
     autoregres_first_masked_coords = autoregressive_first_step(masked_coords)
     decoding_schedule = ar_structure.decoding_schedule(autoregres_first_masked_coords)
-    visualize_token_map(ar_structure.token_map, width=width, height=height, cond_len=cond_len, decoding_schedule=decoding_schedule)
+    attention_mask = ar_structure.get_training_attention_mask(decoding_schedule)
     
-    attention_mask = _get_adam_attention_mask(
-        adam_masks[0], cond_len, index_map, input_token_groups
-    )
+
+    visualize_token_map(ar_structure.token_map, width=width, height=height, cond_len=cond_len, decoding_schedule=decoding_schedule)
+    visualize_attention_mask(attention_mask, ar_structure.token_map, decoding_schedule, width, height)
+    # attention_mask = _get_adam_attention_mask(
+    #     adam_masks[0], cond_len, index_map, input_token_groups
+    # )
 
     _test_index_map(index_map, adam_masks, height, width)
     _test_input_token_groups(input_token_groups, width, height, base_block_size)
-    _test_attention_mask(attention_mask, input_token_groups, adam_masks[0], cond_len)
+    _test_attention_mask(attention_mask, decoding_schedule)
     visualize_adam_masks(adam_masks, f"adam_mask_block_size_{base_block_size}.png")
 
 
