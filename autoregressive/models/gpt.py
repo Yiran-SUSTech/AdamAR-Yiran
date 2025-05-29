@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from utils.drop_path import DropPath
-from autoregressive.models.utils import TokenType, get_autoregressive_structure
+from autoregressive.models.utils.tokens import TokenType
 from autoregressive.models.generate import sample
 
 def find_multiple(n: int, k: int):

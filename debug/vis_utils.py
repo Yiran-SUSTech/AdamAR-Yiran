@@ -1,11 +1,16 @@
+import matplotlib
+matplotlib.use('Agg') 
+
 import token
 from tokenize import Token
 from typing import OrderedDict
 
-from autoregressive.models.utils import TokenMap, TokenMapTensors_v2, TokenType
+from autoregressive.models.utils.tokens import TokenMap, TokenMapTensors, TokenType
 import matplotlib.pyplot as plt
+
 import torch
 import matplotlib.colors as mcolors
+from pathlib import Path
 
 def to_xy(index: int, width: int):
     y = index // width
@@ -16,15 +21,28 @@ def generate_colors(n):
     cmap = plt.get_cmap('hsv')
     return [cmap(i / n) for i in range(n)]
 
-def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
+
+def visualize_adam_masks(masks: list[torch.Tensor], filename: str | Path):
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, len(masks), figsize=(3 * len(masks), 3))
+    for i, mask in enumerate(masks):
+        axes[i].imshow(mask.cpu(), cmap="gray", interpolation="none")
+        axes[i].set_title(f"Pass {i + 1}")
+        axes[i].axis("off")
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+def visualize_token_map(token_map: TokenMap | TokenMapTensors,
                         width: int,
                         height: int,
-                        cond_len: int,
-                        decoding_schedule: list[list[int]] | None = None):
+                        decoding_schedule: list[list[int]] | None = None,
+                        vis_folder: Path | None=None):
     
 
     if isinstance(token_map, TokenMap):
-        token_map = TokenMapTensors_v2(token_map, width, height)
+        token_map = TokenMapTensors(token_map, width, height)
     
     if decoding_schedule is not None:
         num_decoding_step = len(decoding_schedule)
@@ -63,7 +81,10 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
 
                 plt.arrow(in_x, in_y, dx, dy, color='red', head_width=0.5, length_includes_head=True, alpha=0.7)
 
-            plt.savefig(f"step_{step}.jpg")
+            if vis_folder:
+                plt.savefig(vis_folder / f"step_{step}.jpg")
+            else:
+                plt.savefig(f"step_{step}.jpg")
             plt.close()
 
 
@@ -80,17 +101,22 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
     cbar.ax.set_yticklabels(['image', 'learned', 'condition'])  # Human-readable labels
 
     plt.title("Token Map Types")
-    plt.savefig("token_map_types.png")
+    if vis_folder:
+        plt.savefig(vis_folder / "token_map_types.png")
+    else:
+        plt.savefig("token_map_types.png")
+        
     plt.close()
 
 def visualize_attention_mask(attention_mask: torch.Tensor,
-                             token_map: TokenMap | TokenMapTensors_v2,
+                             token_map: TokenMap | TokenMapTensors,
                              decoding_schedule: list[list[int]] | None,
                              height: int,
-                             width: int):
+                             width: int,
+                             vis_folder: Path | None=None):
 
     if isinstance(token_map, TokenMap):
-        token_map = TokenMapTensors_v2(token_map, width, height)
+        token_map = TokenMapTensors(token_map, width, height)
         
     image_len = width * height
     
@@ -123,6 +149,10 @@ def visualize_attention_mask(attention_mask: torch.Tensor,
             plt.imshow(vis_mask.reshape((height, width)), cmap='gray')
             plt.colorbar()
 
-            plt.savefig(f"attention_step_{step}.jpg")
+            if vis_folder:
+                plt.savefig(vis_folder / f"attention_step_{step}.jpg")
+            else:
+                plt.savefig(f"attention_step_{step}.jpg")
+                
             plt.close()
 
