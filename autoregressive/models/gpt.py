@@ -15,6 +15,7 @@ from torch.nn import functional as F
 from utils.drop_path import DropPath
 from autoregressive.models.utils.tokens import TokenType
 from autoregressive.models.generate import sample
+from autoregressive.models.utils.adam import get_autoregressive_structure
 
 def find_multiple(n: int, k: int):
     if n % k == 0:
