@@ -43,10 +43,8 @@ class TestAutoregressiveStructure:
         )
         autoregres_first_masked_coords = autoregressive_first_step(masked_coords)
         decoding_schedule = ar_structure.get_decoding_schedule(autoregres_first_masked_coords)
-        attention_mask = ar_structure.get_training_attention_mask(decoding_schedule)
-
-        _test_attention_mask(attention_mask, decoding_schedule)
-
+        _test_attention_mask(ar_structure.training_attention_mask, decoding_schedule)
+        
         visualize_token_map(ar_structure.token_map, width=self.width, height=self.height, decoding_schedule=decoding_schedule,vis_folder=self.output_dir)
         visualize_attention_mask(ar_structure.training_attention_mask, ar_structure.token_map, decoding_schedule, self.width, self.height, vis_folder=self.output_dir)
         visualize_adam_masks(adam_masks, self.output_dir / f"adam_mask_block_size_{self.base_block_size}.png")
