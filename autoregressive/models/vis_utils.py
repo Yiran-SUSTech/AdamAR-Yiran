@@ -61,8 +61,6 @@ def visualize_token_map(token_map: TokenMap | TokenMapTensors_v2,
                 dx = out_x - in_x
                 dy = out_y - in_y
 
-                if step == 4:
-                    print(f"Step {step}: Drawing arrow from ({in_x}, {in_y}) to ({out_x}, {out_y})")
                 plt.arrow(in_x, in_y, dx, dy, color='red', head_width=0.5, length_includes_head=True, alpha=0.7)
 
             plt.savefig(f"step_{step}.jpg")
@@ -102,7 +100,6 @@ def visualize_attention_mask(attention_mask: torch.Tensor,
     input_image_mask = (token_map.in_token_types == TokenType.IMAGE.value)
     input_indices = token_map.in_token_indices[input_image_mask]
     h, w = torch.meshgrid(output_indices, output_indices)
-    # attention_mask_no_cond = attention_mask[h, w]
     
     vis_map_indices = torch.zeros(image_len, dtype=torch.int)
     vis_map_type = torch.zeros(image_len, dtype=torch.int)

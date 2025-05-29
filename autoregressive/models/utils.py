@@ -732,17 +732,6 @@ def _get_image_token_index_map_v2(
     # passes with learnable tokens
     for i_pass in range(1, len(masked_coords)):
         curr_coords = masked_coords[i_pass].tolist()
-        # if i_pass == 1:
-        #     # learnable token
-        #     for idx, coord in enumerate(curr_coords):
-        #         x, y = coord
-        #         learnable_token = LearnedToken(x_coord=x, y_coord=y)
-        #         pred_img_token = ImageToken(x_coord=x, y_coord=y)
-        #         token_map[learnable_token] = pred_img_token
-        # else:
-            # previous_coords = masked_coords[i_pass - 1].tolist()
-            # prev_coord_len = len(previous_coords)
-            # assert prev_coord_len == len(curr_coords) // 2
 
         generated_tokens = list(t for t in token_map.output_tokens() if t.token_type() == TokenType.IMAGE)
         for curr_coord in curr_coords:
@@ -753,22 +742,6 @@ def _get_image_token_index_map_v2(
             )
             token_map[closest_token] = curr_img_token
             
-            '''
-            for prev_coord, curr_coord in zip(
-                previous_coords, curr_coords[:prev_coord_len]
-            ):
-                prev_x, prev_y = prev_coord
-                curr_x, curr_y = curr_coord
-                prev_img_token = ImageToken(x_coord=prev_x, y_coord=prev_y)
-                curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
-
-                token_map[prev_img_token] = curr_img_token
-
-            for curr_coord in curr_coords[prev_coord_len:]:
-                x, y = curr_coord
-                learnable_token = LearnedToken(x_coord=x, y_coord=y)
-                token_map[learnable_token] = ImageToken(x_coord=x, y_coord=y)
-            '''
 
     token_map_tensors = TokenMapTensors_v2(token_map, width, height)
     return AutoRegressiveStructure(

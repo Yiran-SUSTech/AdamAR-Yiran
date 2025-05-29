@@ -121,7 +121,6 @@ def test_adam_utils_consistency():
         image_tokens, cond_tokens, learnable_token, freqs_cis
     )
     target_token_idx, target_mask = ar_structure.assemble_target_tokens(image_token_idx)
-    # decoding_schedule = ar_structure.fastest_decoding_schedule()
 
     autoregres_first_masked_coords = autoregressive_first_step(masked_coords)
     decoding_schedule = ar_structure.decoding_schedule(autoregres_first_masked_coords)
@@ -130,9 +129,6 @@ def test_adam_utils_consistency():
 
     visualize_token_map(ar_structure.token_map, width=width, height=height, cond_len=cond_len, decoding_schedule=decoding_schedule)
     visualize_attention_mask(attention_mask, ar_structure.token_map, decoding_schedule, width, height)
-    # attention_mask = _get_adam_attention_mask(
-    #     adam_masks[0], cond_len, index_map, input_token_groups
-    # )
 
     _test_index_map(index_map, adam_masks, height, width)
     _test_input_token_groups(input_token_groups, width, height, base_block_size)
