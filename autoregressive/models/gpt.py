@@ -366,8 +366,8 @@ class Transformer(nn.Module):
 
         # TODO: add support for KV cache using input_pos 
         
-        assert self.auto_regr_struct.attention_mask is not None
-        mask = self.auto_regr_struct.attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
+        assert self.auto_regr_struct.training_attention_mask is not None
+        mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
         h = x
         for layer in self.layers:
             h = layer(h, freqs_cis, start_pos=None, mask=mask)
@@ -390,10 +390,10 @@ class Transformer(nn.Module):
 
         h = self.tok_dropout(assem_input_embeddings)
         
-        assert self.auto_regr_struct.attention_mask is not None
+        assert self.auto_regr_struct.training_attention_mask is not None
 
         for layer in self.layers:
-            h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.attention_mask.to(h.device))
+            h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.training_attention_mask.to(h.device))
         
         h = self.norm(h)
         logits = self.output(h).float()
@@ -444,10 +444,10 @@ class Transformer(nn.Module):
         # with torch.device(cond.device):
         #     self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
         
-        input_token_config = list(self.auto_regr_struct.token_map.keys())
-        output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.values())}
+        input_token_config = list(self.auto_regr_struct.token_map.input_tokens())
+        output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.output_tokens())}
         
-        decoding_schedule = self.auto_regr_struct.fastest_decoding_schedule()
+        decoding_schedule = self.auto_regr_struct.decoding_schedule
         for decoding_step in range(len(decoding_schedule)):
             next_decoded_token_group = decoding_schedule[decoding_step]
             next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)

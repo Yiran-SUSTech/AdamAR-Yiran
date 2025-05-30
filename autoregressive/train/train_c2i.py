@@ -84,7 +84,6 @@ def main(args):
         cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
         os.makedirs(cloud_checkpoint_dir, exist_ok=True)
         logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
-    
     else:
         logger = create_logger(None)
 

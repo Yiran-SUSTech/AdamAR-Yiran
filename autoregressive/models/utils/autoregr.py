@@ -56,21 +56,19 @@ class AutoRegressiveStructure:
         input_tokens[:, learned_mask, :] = learnable_token
         input_tokens[:, cond_mask, :] = cond_tokens
 
-        freqs_cis[~cond_mask] = freqs_cis[
-            self.token_map_tensors.in_token_indices[~cond_mask]
-        ]
-
+        freqs_cis = self.assemble_positional_embedding(freqs_cis)
         return input_tokens, freqs_cis
 
     def assemble_positional_embedding(
         self,
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
     ):
-        cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
-        freqs_cis[~cond_mask] = freqs_cis[
-            self.token_map_tensors.out_token_indices[~cond_mask]
+        out_img_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE
+        new_freqs_cis = freqs_cis.clone()
+        new_freqs_cis[out_img_mask] = freqs_cis[
+            self.token_map_tensors.out_token_indices[out_img_mask]
         ]
-        return freqs_cis
+        return new_freqs_cis
     
     def assemble_target_tokens(
         self,
