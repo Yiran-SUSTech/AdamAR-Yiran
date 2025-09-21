@@ -165,7 +165,7 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
     # create an empty tensor of the expected final shape and fill in the current tokens
     seq = torch.empty((max_batch_size, T_new), dtype=torch.int, device=device)
 
-    input_pos = torch.arange(0, T, device=device)
+    input_pos = torch.arange(0, T, device=device) # input_pos: [0]
     next_token = prefill(model, cond_combined, input_pos, cfg_scale, **sampling_kwargs)
     seq[:, T:T+1] = next_token
 

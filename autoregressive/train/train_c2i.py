@@ -20,6 +20,9 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
@@ -46,7 +49,7 @@ def creat_optimizer(model, weight_decay, learning_rate, betas, logger):
     logger.info(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
     # Create AdamW optimizer and use the fused version if it is available
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-    extra_args = dict(fused=True) if fused_available else dict()
+    extra_args = dict(fused=False) if fused_available else dict()
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
     logger.info(f"using fused AdamW: {fused_available}")
     return optimizer
@@ -56,17 +59,12 @@ def creat_optimizer(model, weight_decay, learning_rate, betas, logger):
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
-def main(args):
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-    
-    # Setup DDP:
-    init_distributed_mode(args)
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
+def main(rank, args):
+    dist.init_process_group("xla", init_method='xla://')
+    device = xm.xla_device()
+    rank = 0
+    seed = args.global_seed * xr.global_device_count() + xr.global_ordinal()
+    print(f'| TPU init (rank {xr.global_ordinal()}): device = {device}', flush=True)
 
     # Setup an experiment folder:
     if rank == 0:
@@ -174,14 +172,15 @@ def main(args):
     # adam_attn_mask = get_adam_attention_mask(width, height, model.adam_block_size, model.cls_token_num)
     # adam_attn_mask = adam_attn_mask.unsqueeze(0).repeat(int(args.global_batch_size // dist.get_world_size()), 1, 1)
     
-    model = DDP(model.to(device), device_ids=[args.gpu])
+    # model = DDP(model.to(device), device_ids=[args.gpu])
+    model = model.to(device)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
     # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+    # scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16')) # gpu
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
@@ -197,16 +196,19 @@ def main(args):
             z_indices = x.reshape(x.shape[0], -1)
             c_indices = y.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
-            with torch.cuda.amp.autocast(dtype=ptdtype):  
-                _, loss = model(cond_idx=c_indices, idx=z_indices)
+            # with torch.cuda.amp.autocast(dtype=ptdtype):  
+            # Peihan: I have not set up training on mixed precisions
+            _, loss = model(cond_idx=c_indices, idx=z_indices)
             # backward pass, with gradient scaling if training in fp16         
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward() # gpu
+            loss.backward() # tpu
             if args.max_grad_norm != 0.0:
-                scaler.unscale_(optimizer)
+                # scaler.unscale_(optimizer) # gpu
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             # step the optimizer and scaler if training in fp16
-            scaler.step(optimizer)
-            scaler.update()
+            # scaler.step(optimizer) # gpu
+            xm.optimizer_step(optimizer) # tpu
+            # scaler.update() # gpu
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)
             if args.ema:
@@ -218,13 +220,21 @@ def main(args):
             train_steps += 1
             if train_steps % args.log_every == 0:
                 # Measure training speed:
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize() # gpu
+                xm.mark_step() # tpu
                 end_time = time.time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
+                
+                # gpu
+                # avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                # dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                # avg_loss = avg_loss.item() / dist.get_world_size()
+                
+                # tpu
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                avg_loss = xm.all_reduce('sum', [avg_loss])[0] / xr.global_device_count()
+
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -254,7 +264,9 @@ def main(args):
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-                dist.barrier()
+
+                # dist.barrier() # gpu
+                xm.rendezvous("post_setup_barrier") # tpu
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -300,4 +312,4 @@ if __name__ == "__main__":
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     args = parser.parse_args()
-    main(args)
+    torch_xla.launch(main, args=(args,))

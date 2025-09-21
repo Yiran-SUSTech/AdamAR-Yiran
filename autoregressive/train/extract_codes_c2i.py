@@ -10,6 +10,27 @@ from torchvision import transforms
 import numpy as np
 import argparse
 import os
+import sys
+
+
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root_dir = os.path.join(current_script_dir, '../../') # adjust the path based on your project structure
+project_root_dir = os.path.abspath(project_root_dir)
+
+if project_root_dir not in sys.path:
+    sys.path.insert(0, project_root_dir)
+
+from utils.logger import create_logger
+from utils.distributed import init_distributed_mode
+from utils.ema import update_ema, requires_grad
+from dataset.build import build_dataset
+from autoregressive.models.gpt import GPT_models
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root_dir = os.path.join(current_script_dir, '../../')
+project_root_dir = os.path.abspath(project_root_dir)
+
+if project_root_dir not in sys.path:
+    sys.path.insert(0, project_root_dir)
 
 from utils.distributed import init_distributed_mode
 from dataset.augmentation import center_crop_arr
@@ -84,7 +105,8 @@ def main(args):
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        # pin_memory=True,
+        pin_memory=False,
         drop_last=False
     )
 

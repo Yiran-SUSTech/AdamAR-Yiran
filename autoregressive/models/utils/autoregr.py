@@ -1,9 +1,12 @@
 import torch
+import torch.distributed as dist
 from autoregressive.models.utils.tokens import  TokenMap, TokenMapTensors, \
     TokenType, ImageToken
     
 from jaxtyping import Float, Int64
 from dataclasses import dataclass
+
+from typing import Optional
 
 @dataclass
 class AutoRegressiveStructure:
@@ -13,17 +16,48 @@ class AutoRegressiveStructure:
     training_attention_mask: torch.Tensor
 
     def __init__(self,
+                 logger, ##############################################
                  image_width: int,
                  image_height: int,
                  token_map: TokenMap,
                  decoded_masked_coords: list[torch.Tensor]):
+        self.logger = logger ##############################################
       
         self.token_map = token_map
         self.token_map_tensors = TokenMapTensors(token_map, image_width, image_height)   
         self._cond_len = self.token_map.cond_len
         
-        self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords)
+        self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords) # decoding_schedule其实是output token的index的list，也就是从0到total_len-1
         self.training_attention_mask = self.get_training_attention_mask(self.decoding_schedule)
+        
+        if dist.get_rank() == 0:
+            print(f"len(token_map): {len(token_map)}") ##############################################
+            num_output_image_tokens = 0
+            for i_pass, coords_i_pass in enumerate(decoded_masked_coords):
+                print(f"pass {i_pass}:")
+                coords_n_indics = []
+                for coord in coords_i_pass.tolist():
+                    x, y = coord
+                    output_token_index = self.token_map.get_output_token_index((ImageToken(x, y)))
+                    coords_n_indics.append([x,y,output_token_index])
+                print(coords_n_indics)
+                num_output_image_tokens += len(coords_i_pass.tolist())
+            print("^"*50)
+            print("input token and corresponding output token indices:")
+            print(f"total num input tokens: {len(self.token_map._input_index.keys())}")
+            total_input_image_tokens = 0
+            for inp_token in self.token_map._input_index.keys():
+                if inp_token.token_type() != TokenType.IMAGE:
+                    continue
+                output_token_indices = self.token_map._input_index[inp_token]
+                total_input_image_tokens += len(output_token_indices)
+                print(f"input token pos: [{inp_token.x_coord}, {inp_token.y_coord}] appeared {len(output_token_indices)} times in input sequence: {output_token_indices}")
+            print(f"total input image tokens: {total_input_image_tokens}")
+            print("^"*50)
+            print(f"num_output_image_tokens: {num_output_image_tokens}") ##############################################
+            print(f"Decoding schedule: {self.decoding_schedule}") ##############################################
+            print(f"training attention mask: {self.training_attention_mask}") ##############################################
+            print(f"shape of training attention mask: {self.training_attention_mask.shape}") ##############################################
         
     # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_input_tokens(
@@ -32,7 +66,8 @@ class AutoRegressiveStructure:
         cond_tokens: Float[torch.Tensor, "batch_size cond_len embed_dim"],
         learnable_token: Float[torch.Tensor, "embed_dim"],
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
-        device: torch.device | None = None,
+        device: Optional[torch.device] = None,
+        is_random: bool = False, ##############################################
     ):
         if device is None:
             device = image_tokens.device
@@ -63,17 +98,27 @@ class AutoRegressiveStructure:
         self,
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
     ):
-        out_img_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE
-        new_freqs_cis = freqs_cis.clone()
-        new_freqs_cis[out_img_mask] = freqs_cis[
-            self.token_map_tensors.out_token_indices[out_img_mask]
+        in_img_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        in_con_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+
+        new_freqs_cis = torch.empty(in_img_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
+        cond_lenn = self.token_map.cond_len
+
+        new_freqs_cis[in_img_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[in_img_mask]+cond_lenn 
+            # +cond_lenn is because the freqs_cis is of shape (cls_token_num+grid_size**2, head_dim // 2, 2)
+            # the first frequency for image token is freqs_cis[cond_lenn]
         ]
+        new_freqs_cis[in_con_mask] = freqs_cis[
+            self.token_map_tensors.in_token_indices[in_con_mask]
+        ]
+        
         return new_freqs_cis
     
     def assemble_target_tokens(
         self,
         image_token_idx: Int64[torch.Tensor, "batch_size image_len"],
-        device: torch.device | None = None,
+        device: Optional[torch.device] = None,
     ):
         if device is None:
             device = image_token_idx.device
@@ -99,7 +144,7 @@ class AutoRegressiveStructure:
 
         target_tokens[:, image_mask] = reordered_image_token_idx
         target_mask[:, image_mask] = True
-
+        
         return target_tokens, target_mask
 
     def assemble_input_tokens_for_decoding(
@@ -108,7 +153,7 @@ class AutoRegressiveStructure:
         cond_tokens: Float[torch.Tensor, "batch_size cond_len embed_dim"],
         learnable_token: Float[torch.Tensor, "embed_dim"],
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
-        device: torch.device | None = None,
+        device: Optional[torch.device] = None,
     ):
         if device is None:
             device = image_tokens.device

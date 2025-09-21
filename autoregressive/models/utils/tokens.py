@@ -2,25 +2,24 @@ import math
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import Iterable, Sequence
 
 import torch
 from jaxtyping import Int
 
-TOKEN_MAP_KEY_TYPE = str | int
+from typing import Union
+
+
+TOKEN_MAP_KEY_TYPE = Union[str, int]
 INVALID_TOKEN = -100
 
 
 class TokenType(Enum):
-    @staticmethod
-    def _generate_next_value_(name, start, count, last_values):
-        return torch.iinfo(torch.int).min + count
-
-    IMAGE = auto()
-    LEARNED = auto()
-    CONDITION = auto()
-    EMPTY = auto()
+    IMAGE = torch.iinfo(torch.int).min
+    LEARNED = torch.iinfo(torch.int).min + 1
+    CONDITION = torch.iinfo(torch.int).min + 2
+    EMPTY = torch.iinfo(torch.int).min + 3
 
 
 @dataclass(frozen=True)
@@ -46,13 +45,12 @@ class SpatialToken(Token):
 
 
 def spatial_token_distance(token: SpatialToken, other: SpatialToken, type: str="manhattan") -> float:
-    match type.lower(): 
-        case "manhattan":
-            return abs(token.x_coord - other.x_coord) + abs(token.y_coord - other.y_coord)
-        case "euclidean":
-            return math.sqrt((token.x_coord - other.x_coord) ** 2 + (token.y_coord - other.y_coord) ** 2)
-        case _:
-            raise ValueError(f"Unknown distance type: {type}")
+    if type.lower() == "manhattan":
+        return abs(token.x_coord - other.x_coord) + abs(token.y_coord - other.y_coord)
+    elif type.lower() == "euclidean":
+        return math.sqrt((token.x_coord - other.x_coord) ** 2 + (token.y_coord - other.y_coord) ** 2)
+    else:
+        raise ValueError(f"Unknown distance type: {type}")  
     
 @dataclass(frozen=True)
 class LearnedToken(SpatialToken):
@@ -148,29 +146,29 @@ class TokenMapTensors:
         )
 
         for idx, (in_token, out_token) in enumerate(token_map.items()):
-            match out_token.token_type():
-                case TokenType.IMAGE:
-                    self.out_token_indices[idx] = out_token.image_index(width)
-                    self.out_token_types[idx] = out_token.token_type().value
-                case TokenType.EMPTY:
-                    self.out_token_indices[idx] = TokenType.EMPTY.value
-                    self.out_token_types[idx] = TokenType.EMPTY.value
-                case TokenType.CONDITION | TokenType.LEARNED:
-                    assert False, (
-                        "Condition or learnable token should not be in output token map"
-                    )
-
+            
+            out_token_type = out_token.token_type()
+            if out_token_type == TokenType.IMAGE:
+                self.out_token_indices[idx] = out_token.image_index(width) # 第i个out_token在图片中的index
+                self.out_token_types[idx] = out_token_type.value
+            elif out_token_type == TokenType.EMPTY:
+                self.out_token_indices[idx] = TokenType.EMPTY.value
+                self.out_token_types[idx] = TokenType.EMPTY.value
+            elif out_token_type == TokenType.CONDITION or out_token_type == TokenType.LEARNED:
+                assert False, (
+                    "Condition or learnable token should not be in output token map"
+                )
+                
             in_token_type = in_token.token_type()
-            match in_token_type:
-                case TokenType.IMAGE | TokenType.LEARNED:
-                    self.in_token_indices[idx] = in_token.image_index(width)
-                    self.in_token_types[idx] = in_token_type.value
-                case TokenType.EMPTY:
-                    self.in_token_indices[idx] = TokenType.EMPTY.value
-                    self.in_token_types[idx] = TokenType.EMPTY.value
-                case TokenType.CONDITION:
-                    self.in_token_indices[idx] = in_token.cond_index
-                    self.in_token_types[idx] = in_token_type.value
+            if in_token_type == TokenType.IMAGE or in_token_type == TokenType.LEARNED:
+                self.in_token_indices[idx] = in_token.image_index(width)
+                self.in_token_types[idx] = in_token_type.value
+            elif in_token_type == TokenType.EMPTY:
+                self.in_token_indices[idx] = TokenType.EMPTY.value
+                self.in_token_types[idx] = TokenType.EMPTY.value
+            elif in_token_type == TokenType.CONDITION:
+                self.in_token_indices[idx] = in_token.cond_index
+                self.in_token_types[idx] = in_token_type.value
 
 
 def find_closest_token(
@@ -184,16 +182,49 @@ def find_closest_token(
     
     min_dist = float("inf")
     closest_token = None
-    closest_index = float("inf")
+    closest_index = float("inf") 
+    # closest_index = -1000000 # for max index
     
     for token in candidate_tokens:
         dist = spatial_token_distance(query_token, token)
         index = token.image_index(image_width)
 
         if dist < min_dist or (dist == min_dist and index < closest_index):
+        # if dist < min_dist or (dist == min_dist and index > closest_index): # for max index
             min_dist = dist
             closest_token = token
             closest_index = index
 
     assert closest_token is not None, "No closest token found"
     return closest_token
+
+def find_unattached_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    lest_attached_token = None
+    min_dist = float("inf")
+    lest_attached_index = -1000000 #####################
+    lest_attached_times = float("inf")
+    
+    for token in candidate_tokens:
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+        attached_times = len(token_map._input_index[token])
+
+        if attached_times < lest_attached_times or \
+            (attached_times == lest_attached_times and dist < min_dist) or \
+            (attached_times == lest_attached_times and dist == min_dist and index < lest_attached_index): ###############
+            lest_attached_times = attached_times
+            lest_attached_token = token
+            lest_attached_index = index
+            min_dist = dist
+
+    assert lest_attached_token is not None, "No closest token found"
+    return lest_attached_token

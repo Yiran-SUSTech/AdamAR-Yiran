@@ -12,12 +12,10 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import torch.distributed as dist
 from utils.drop_path import DropPath
 from autoregressive.models.utils.tokens import TokenType
 from autoregressive.models.generate import sample
 from autoregressive.models.utils.adam import get_autoregressive_structure
-from torch.nn.attention import sdpa_kernel, SDPBackend
 
 import numpy as np
 
@@ -59,10 +57,8 @@ class ModelArgs:
     max_seq_len: int = 2048
     
     adam_block_size: int = 8
-    subpass_len: int = None  # divide each pass into several subpasses, each subpass has subpass_len tokens
-    subpass_num: int = None  # divide each pass into several subpasses, each pass has subpass_num subpasses
+    is_serial: bool = False  # whether to use serial attention mask for training and generation
     logger: Optional[object] = None
-    is_random: bool = False  # whether to use random attention mask for training and generation
 
 
 #################################################################################
@@ -209,11 +205,6 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
         total_kv_dim = (self.n_head + 2 * self.n_kv_head) * self.head_dim
-        
-        # if dist.get_rank() == 0:
-        #     print("-"*50)
-        #     print(f"dim: {self.dim}, Attention: n_head: {self.n_head}, n_kv_head: {self.n_kv_head}, head_dim: {self.head_dim}, total_kv_dim: {total_kv_dim}")
-        #     print("-"*50)
 
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_kv_dim, bias=False)
@@ -242,19 +233,12 @@ class Attention(nn.Module):
 
         xq, xk, xv = map(lambda x: x.transpose(1, 2), (xq, xk, xv))
 
-        if self.kv_cache is not None: # different from RandAR
+        if self.kv_cache is not None:
             keys, values = self.kv_cache.update(input_pos, xk, xv)
         else:
             keys, values = xk, xv
         keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
         values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
-
-        # if dist.get_rank() == 0:
-        #     print(f"xq shape: {xq.shape}, is_contiguous: {xq.is_contiguous()}")
-        #     print(f"keys shape: {keys.shape}, is_contiguous: {keys.is_contiguous()}")
-        #     # print(f"values shape: {values.shape}, is_contiguous: {values.is_contiguous()}")
-        #     if mask is not None:
-        #         print(f"mask shape: {mask.shape}, is_contiguous: {mask.is_contiguous()}")
 
         output = F.scaled_dot_product_attention(
             xq, keys, values, 
@@ -297,9 +281,7 @@ class Transformer(nn.Module):
         self.adam_block_size = config.adam_block_size
         ######################################################
         self.logger = config.logger
-        self.subpass_len = config.subpass_len
-        self.subpass_num = config.subpass_num
-        self.is_random = config.is_random # randomly reorder the tokens within each pass
+        self.is_serial = config.is_serial
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -317,7 +299,7 @@ class Transformer(nn.Module):
         self.auto_regr_struct = get_autoregressive_structure(width=width, height=height, 
                                                              base_block_size=config.adam_block_size, 
                                                              cond_len=config.cls_token_num, 
-                                                             logger=self.logger, subpass_len=self.subpass_len, subpass_num=self.subpass_num)
+                                                             logger=self.logger, is_serial=self.is_serial)
         self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
         
         
@@ -335,8 +317,7 @@ class Transformer(nn.Module):
         grid_size = int(self.block_size ** 0.5)
         assert grid_size * grid_size == self.block_size
         self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
-        # if dist.get_rank() == 0:
-        #     print(f"self.freqs_cis.shape: {self.freqs_cis.shape}")
+        
         # KVCache
         self.max_batch_size = -1
         self.max_seq_length = -1
@@ -369,15 +350,11 @@ class Transformer(nn.Module):
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
 
-        # causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
-        causal_mask = torch.zeros(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
-        grid_size = self.auto_regr_struct.training_attention_mask.shape[0]
-        grid_size = int(grid_size)
-        causal_mask[:grid_size, :grid_size] = self.auto_regr_struct.training_attention_mask
+        causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
         self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        # grid_size = int(self.config.block_size ** 0.5)
-        # assert grid_size * grid_size == self.block_size
-        # self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
+        grid_size = int(self.config.block_size ** 0.5)
+        assert grid_size * grid_size == self.block_size
+        self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
 
     def forward(
         self, 
@@ -403,20 +380,12 @@ class Transformer(nn.Module):
         """
 
         # TODO: add support for KV cache using input_pos 
-        # if dist.get_rank() == 0:
-        #     print("^"*50)
-        #     print(f"input_pos inside forward_inference: {input_pos}")
-        #     print(f"x.shape inside forward_inference: {x.shape}")
-        #     print(f"freqs_cis.shape inside forward_inference: {freqs_cis.shape}")
-        #     print("^"*50)
         
         assert self.auto_regr_struct.training_attention_mask is not None
-        # mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
-        mask = self.causal_mask[:x.shape[0], None, input_pos].to(x.device)
+        mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
         h = x
         for layer in self.layers:
-            # h = layer(h, freqs_cis, start_pos=input_pos, mask=self.causal_mask)
-            h = layer(h, freqs_cis, start_pos=input_pos, mask=mask)
+            h = layer(h, freqs_cis, start_pos=None, mask=mask)
         h = self.norm(h)
         logits = self.output(h).float()
         return logits
@@ -437,13 +406,6 @@ class Transformer(nn.Module):
         h = self.tok_dropout(assem_input_embeddings)
         
         assert self.auto_regr_struct.training_attention_mask is not None
-
-        # if dist.get_rank() == 0:
-        #     print('#'*50)
-        #     print(f'shape of h: {h.shape}')
-        #     print(f'shape of assem_freqs_cis: {assem_freqs_cis.shape}')
-        #     print(f'shape of self.freqs_cis: {self.freqs_cis.shape}')
-        #     print('#'*50)
 
         for layer in self.layers:
             h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.training_attention_mask.to(h.device))
@@ -479,8 +441,7 @@ class Transformer(nn.Module):
         
         self.freqs_cis = self.freqs_cis.to(cond_idx.device)
         assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
-        bs = cond_idx.shape[0]
-        cond_lenn = self.cls_token_num
+        bs = cond_idx.shape[0]        
         decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
         if cfg_scales[-1] > 1.0:
             cond_null = torch.ones_like(cond_idx) * self.num_classes
@@ -496,65 +457,59 @@ class Transformer(nn.Module):
             
         # TODO: add support for KV cache (below code is from RandAR)
         # Step-4: KV Cache setup
-        max_seq_len = cond_combined_tokens.shape[1] + self.block_size
-        with torch.device(cond_idx.device):
-            self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
-        
+        # max_seq_len = cond_combined_tokens.shape[1] + self.block_size * 2
+        # with torch.device(cond.device):
+        #     self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
         
         input_token_config = list(self.auto_regr_struct.token_map.input_tokens())
         output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.output_tokens())}
         
         decoding_schedule = self.auto_regr_struct.decoding_schedule
+        ##############################################################
+        if self.is_serial:
+            new_decoding_schedule = []
+            for ds in decoding_schedule:
+                ds_n_step = split_list(ds, 1)
+                new_decoding_schedule += list(ds_n_step)
+            decoding_schedule = new_decoding_schedule
+        ##############################################################
 
         for decoding_step in range(len(decoding_schedule)):
             next_decoded_token_group = decoding_schedule[decoding_step]
-            # next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
-            next_embeddings = torch.zeros((bs, len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
-
+            next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
             for idx, next_decoded_token_idx in enumerate(next_decoded_token_group):
-                # next_decoded_token_idx是即将生成的token在output tokens中的位置
                 input_token = input_token_config[next_decoded_token_idx]
-                # input_token是即将生成的token的前序token
                 input_token_type = input_token.token_type()
-                
-                if input_token_type == TokenType.IMAGE:
-                    tmp = output_token_config[input_token]
-                    # next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
-                    img_emb = self.tok_embeddings(decoded_indices[:, tmp])   # [bs, dim]
-                    if cfg_scales[-1] > 1.0:
-                        img_emb = torch.cat([img_emb, img_emb], dim=0)       # [2*bs, dim]
-                    next_embeddings[:, idx, :] = img_emb
-                elif input_token_type == TokenType.LEARNED:
-                    next_embeddings[:, idx, :] = self.learnable_pos_embedding[None, None]
-                elif input_token_type == TokenType.CONDITION:
-                    next_embeddings[:, idx, :] = cond_combined_tokens[:, input_token.cond_index, :]
-                else:
-                    assert False, f"Invalid token type {input_token_type}"
-                    
-                
+                match input_token_type:
+                    case TokenType.IMAGE:
+                        tmp = output_token_config[input_token]
+                        next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
+                    case TokenType.LEARNED:
+                        next_embeddings[:, idx, :]  = self.learnable_pos_embedding[None, None]
+                    case TokenType.CONDITION:
+                        next_embeddings[:, idx, :] = cond_combined_tokens[:, input_token.cond_index, :]
+                    case _:
+                        assert False, f"Invalid token type {input_token_type}"     
 
-            # x = torch.cat([x, next_embeddings], dim=1)
-            # input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
-            # freqs_cis = assembled_freq_cis[input_pos]
-            input_pos = torch.tensor(next_decoded_token_group, device=cond_idx.device)
+            if cfg_scales[-1] > 1.0:
+                next_embeddings = torch.cat([next_embeddings, next_embeddings], dim=0)
+
+            x = torch.cat([x, next_embeddings], dim=1)
+            input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
             freqs_cis = assembled_freq_cis[input_pos]
         
-            # assert x.shape[1] == freqs_cis.shape[0]
-            assert next_embeddings.shape[1] == freqs_cis.shape[0]
+            assert x.shape[1] == freqs_cis.shape[0]
 
             decoded_token_group = decoding_schedule[decoding_step]
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
-            # logits = self.forward_inference(x, freqs_cis, input_pos)
-            with sdpa_kernel(SDPBackend.MATH):
-                logits = self.forward_inference(next_embeddings, freqs_cis, input_pos)
+            logits = self.forward_inference(x, freqs_cis, input_pos)
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
                 logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
 
             logits = logits[:, -num_decoded_tokens:] # [bs, query_num, vocab_size]
-            
             indices = torch.zeros(decoded_indices.shape[0], num_decoded_tokens, dtype=torch.long, device=x.device)
             for i in range(num_decoded_tokens):
                 indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
@@ -565,12 +520,7 @@ class Transformer(nn.Module):
         
         image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
         decoded_indices = decoded_indices[:, image_mask]
-
         _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
-        # if dist.get_rank() == 0:
-        #     print('#'*50)
-        #     print(f"back_order: {back_order}")
-        #     print('#'*50)
         final_decoded_indices = decoded_indices[:, back_order]
         return final_decoded_indices
             
@@ -593,7 +543,7 @@ def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_
     half_dim = n_elem // 2
     freqs = 1.0 / (base ** (torch.arange(0, half_dim, 2)[: (half_dim // 2)].float() / half_dim))
     t = torch.arange(grid_size, device=freqs.device)
-    freqs = torch.outer(t, freqs) # (grid_size, head_dim // 4)
+    freqs = torch.outer(t, freqs) # (grid_size, head_dim // 2)
     freqs_grid = torch.concat([
         freqs[:, None, :].expand(-1, grid_size, -1),
         freqs[None, :, :].expand(grid_size, -1, -1),
@@ -601,27 +551,12 @@ def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_
     cache_grid = torch.stack([torch.cos(freqs_grid), torch.sin(freqs_grid)], dim=-1) # (grid_size, grid_size, head_dim // 2, 2)
     cache = cache_grid.flatten(0, 1)
     cond_cache = torch.cat([torch.zeros(cls_token_num, n_elem // 2, 2), cache]) # (cls_token_num+grid_size**2, head_dim // 2, 2)
-    # if dist.get_rank() == 0:
-    #     print("*"*50)
-    #     print(f"freqs.shape inside precompute_freqs_cis_2d: {freqs.shape}")
-    #     print(f"freqs[:, None, :].expand(-1, grid_size, -1).shape inside precompute_freqs_cis_2d: {freqs[:, None, :].expand(-1, grid_size, -1).shape}")
-    #     print(f"freqs_grid.shape inside precompute_freqs_cis_2d: {freqs_grid.shape}")
-    #     print(f"cache_grid.shape inside precompute_freqs_cis_2d: {cache_grid.shape}")
-    #     print(f"cond_cache.shape inside precompute_freqs_cis_2d: {cond_cache.shape}")
-    #     print("*"*50)
     return cond_cache 
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
-    # if dist.get_rank() == 0:
-    #     print("#"*50)
-    #     print(f"freqs_cis.shape inside apply_rotary_emb: {freqs_cis.shape}")
-    #     print(f"x.shape inside apply_rotary_emb: {x.shape}")
-    #     print(f"so according to x, bs: {x.shape[0]}, seq_len: {x.shape[1]}, n_head: {x.shape[2]}, head_dim: {x.shape[3]}")
-    #     print(f"and according to freqs_cis, seq_len: {freqs_cis.shape[0]}, head_dim // 2: {freqs_cis.shape[1]}")
-    #     print("#"*50)
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
     x_out2 = torch.stack([
@@ -667,7 +602,3 @@ GPT_models = {
     'GPT-B': GPT_B, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
     'GPT-1B': GPT_1B, 'GPT-3B': GPT_3B, 'GPT-7B': GPT_7B, 
 }
-
-
-
-

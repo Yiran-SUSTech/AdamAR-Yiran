@@ -15,6 +15,30 @@ from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate import generate
 
 
+import wandb
+import numpy as np
+
+# # 假设你已经初始化了 wandb
+# wandb.init(project="tensor-image-sample")
+
+# # 2. 将张量转换为 NumPy 数组并处理
+# # 如果张量在 GPU 上，需要先 .cpu()
+# image_np = tensor_image.detach().cpu().numpy()
+
+# # 3. 调整维度，从 (C, H, W) 到 (H, W, C)
+# image_np = np.transpose(image_np, (1, 2, 0))
+
+# # 4. 转换数据类型，从浮点数到 uint8
+# # WandB 默认期望 0-255 的整数
+# image_np = (image_np * 255).astype(np.uint8)
+
+# # 5. 使用 wandb.Image() 记录图片
+# wandb.log({"example_tensor_image": wandb.Image(image_np, caption=f"Generated from a torch.Tensor in iteration: {i}")})
+
+# wandb.finish()
+
+
+
 def main(args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
@@ -22,6 +46,10 @@ def main(args):
     torch.backends.cudnn.benchmark = False
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # init wandb
+    wandb.require("core")
+    wandb.init(project="tensor-image-sample")
 
     # create and load model
     vq_model = VQ_models[args.vq_model](
@@ -72,31 +100,41 @@ def main(args):
         ) # requires PyTorch 2.0 (optional)
     else:
         print(f"no need to compile model in demo") 
+    for i in list(range(3)):
+        # Labels to condition the model with (feel free to change):
+        class_labels = [0] #[207, 360, 387, 974, 88, 979, 417, 279]
+        # class_labels = [0, 0, 5, 5, 55, 55, 0, 0] #[207, 360, 387, 974, 88, 979, 417, 279]
+        c_indices = torch.tensor(class_labels, device=device)
+        qzshape = [len(class_labels), args.codebook_embed_dim, latent_size, latent_size]
 
-    # Labels to condition the model with (feel free to change):
-    class_labels = [0, 0, 0 ,0, 0, 0, 0, 0] #[207, 360, 387, 974, 88, 979, 417, 279]
-    c_indices = torch.tensor(class_labels, device=device)
-    qzshape = [len(class_labels), args.codebook_embed_dim, latent_size, latent_size]
-
-    t1 = time.time()
-    index_sample = gpt_model.generate(c_indices, cfg_scales=(1.0, 1.0),
-                       temperature=args.temperature, 
-                       top_k=args.top_k,
-                       top_p=args.top_p)
+        t1 = time.time()
+        index_sample = gpt_model.generate(c_indices, latent_size ** 2, cfg_scales=(args.cfg_scale, args.cfg_scale),
+                        temperature=args.temperature, 
+                        top_k=args.top_k,
+                        top_p=args.top_p)
 
 
-    sampling_time = time.time() - t1
-    print(f"gpt sampling takes about {sampling_time:.2f} seconds.")    
-    
-    t2 = time.time()
-    samples = vq_model.decode_code(index_sample, qzshape) # output value is between [-1, 1]
-    decoder_time = time.time() - t2
-    print(f"decoder takes about {decoder_time:.2f} seconds.")
+        sampling_time = time.time() - t1
+        print(f"gpt sampling takes about {sampling_time:.2f} seconds.")    
+        
+        t2 = time.time()
+        samples = vq_model.decode_code(index_sample, qzshape) # output value is between [-1, 1]
+        decoder_time = time.time() - t2
+        print(f"decoder takes about {decoder_time:.2f} seconds.")
 
-    # Save and display images:
-    save_image(samples, "sample_{}.png".format(args.gpt_type), nrow=4, normalize=True, value_range=(-1, 1))
-    print(f"image is saved to sample_{args.gpt_type}.png")
+        # log to wandb
+        image_np = samples.detach().cpu().numpy()
+        image_np = image_np[0]
+        image_np = (image_np + 1.0) / 2.0
+        image_np = np.transpose(image_np, (1, 2, 0))
+        image_np = (image_np * 255).astype(np.uint8)
+        wandb.log({"example_tensor_image": wandb.Image(image_np, caption=f"Generated from a torch.Tensor in iteration: {i}")})
 
+        # Save and display images:
+        save_image(samples, "sample_{}.png".format(args.gpt_type), nrow=4, normalize=True, value_range=(-1, 1))
+        print(f"image is saved to sample_{args.gpt_type}.png")
+
+    wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -114,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 384, 512], default=384)
     parser.add_argument("--downsample-size", type=int, choices=[8, 16], default=16)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--cfg-interval", type=float, default=-1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=2000,help="top-k value to sample with")

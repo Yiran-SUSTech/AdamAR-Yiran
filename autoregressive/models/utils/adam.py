@@ -3,6 +3,8 @@ import math
 from dataclasses import dataclass
 from autoregressive.models.utils.tokens import *
 from autoregressive.models.utils.autoregr import AutoRegressiveStructure
+import torch.distributed as dist
+
 
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
@@ -77,9 +79,21 @@ def get_adam_pattern(
 
             patterns.append((x_start, y_start, x_stride, y_stride))
 
-    assert len(shift_patterns) == num_passes - 1, (
-        "shift_patterns must have length num_passes - 1"
-    )
+    ####################################
+    if dist.get_rank() == 0:
+        print("#"*50)
+        print("Adam patterns (x_start, y_start, x_step, y_step):")
+        for i, pattern in enumerate(patterns):
+            print(f"Pass {i}: {pattern}")
+        print("Adam shift patterns:")
+        print("#"*50)
+        for i, shift_pattern in enumerate(shift_patterns):
+            print(f"Pass {i} shifts:")
+            for key, sp in shift_pattern.items():
+                print(f"  {key}: (x_shift={sp.x_shift}, y_shift={sp.y_shift})")
+        print("#"*50)
+    ####################################
+
     return patterns, shift_patterns
 
 
@@ -113,18 +127,70 @@ def generalized_adam_interlacing(width: int, height: int, base_block_size: int):
 
 
 def autoregressive_first_step(adam_coords: list[torch.Tensor]) -> list[torch.Tensor]:
-    autoregressive_first_step = adam_coords[0].split(1, dim=0)
-    new_adam_coords = list(autoregressive_first_step) + adam_coords[1:]
+    ar_first_step = adam_coords[0].split(1, dim=0)
+    new_adam_coords = list(ar_first_step) + adam_coords[1:]
+    
+    return new_adam_coords
+
+# set subpass by length of each subpass
+def set_subpass_by_len(adam_coords: list[torch.Tensor], subpass_len: int=1) -> list[torch.Tensor]:
+    new_adam_coords = []
+    assert subpass_len > 0, "subpass_len must be greater than 0"
+    for pass_idx, adam_coord in enumerate(adam_coords):
+        if pass_idx == 0: # do not mess up with the first pass
+            new_adam_coords.append(adam_coord)
+            continue
+        # if subpass length is 0, then, it is serial generation within each pass
+        autoregressive_n_step = adam_coord.split(subpass_len, dim=0)
+        new_adam_coords += list(autoregressive_n_step)
+    
+    return new_adam_coords
+
+# set subpass by number of subpasses within each pass
+def set_subpass_by_num(adam_coords: list[torch.Tensor], subpass_num: int=4) -> list[torch.Tensor]:
+    new_adam_coords = []
+    assert subpass_num >= 1, "subpass_num must be equal or greater than 1"
+    for pass_idx, adam_coord in enumerate(adam_coords):
+        if pass_idx == 0: # do not mess up with the first pass
+            new_adam_coords.append(adam_coord)
+            continue
+        subpass_len = math.ceil(len(adam_coord) / subpass_num)
+        autoregressive_n_step = adam_coord.split(subpass_len, dim=0)
+        new_adam_coords += list(autoregressive_n_step)
+    
     return new_adam_coords
 
 def get_autoregressive_structure(
+    logger, 
     width: int,
     height: int,
     base_block_size: int,
     cond_len: int,
+    subpass_len: int=None, # subpass_len==1 means serial generation within each pass
+    subpass_num: int=None,
 ) -> AutoRegressiveStructure:
     _, masked_coords, _ = generalized_adam_interlacing(width, height, base_block_size)
     total_len = width * height + cond_len
+
+    #########################################
+    assert (subpass_len is None) or (subpass_num is None), "Only one of subpass_len and subpass_num should be set"
+    if subpass_len is not None:
+        masked_coords = set_subpass_by_len(masked_coords, subpass_len)
+    if subpass_num is not None:
+        masked_coords = set_subpass_by_num(masked_coords, subpass_num)
+    #########################################
+
+    if dist.get_rank() == 0:
+        num_output_image_tokens = 0
+        for i_pass, coords_i_pass in enumerate(masked_coords):
+            print(f"pass {i_pass}:")
+            coords_n_indics = []
+            for coord in coords_i_pass.tolist():
+                x, y = coord
+                coords_n_indics.append([x,y])
+            print(coords_n_indics)
+            num_output_image_tokens += len(coords_i_pass.tolist())
+        print(f"num_output_image_tokens: {num_output_image_tokens}")
 
     token_map: TokenMap = TokenMap()
     first_pass_coords = masked_coords[0].tolist()
@@ -132,6 +198,7 @@ def get_autoregressive_structure(
         x_coord=first_pass_coords[0][0], y_coord=first_pass_coords[0][1]
     )
 
+    # bi_attention_size, num_generated_tokens_per_pass seem not important ################################
     bi_attention_size = total_len - cond_len - len(first_pass_coords)
     num_generated_tokens_per_pass = [len(coords) for coords in masked_coords[1:]]
     assert sum(num_generated_tokens_per_pass) == bi_attention_size
@@ -143,8 +210,10 @@ def get_autoregressive_structure(
     for num in num_generated_tokens_per_pass:
         num_prev_tokens += num
         bi_attention_mask[num_prev_tokens - num : num_prev_tokens, :num_prev_tokens] = 1
+    ################################
 
     # add condition tokens
+    # when GPT gets condition token, it should predict the first image token
     for i in range(cond_len):
         cond_token = ConditionToken(cond_index=i)
         if i == cond_len - 1:
@@ -152,21 +221,37 @@ def get_autoregressive_structure(
         else:
             token_map[cond_token] = EmptyToken()
 
+    # # autoregressive first pass
+    # for idx in range(len(first_pass_coords) - 1):
+    #     curr_coords = first_pass_coords[idx]
+    #     next_coords = first_pass_coords[idx + 1]
+
+    #     curr_x, curr_y = curr_coords
+    #     next_x, next_y = next_coords
+
+    #     curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
+    #     next_img_token = ImageToken(x_coord=next_x, y_coord=next_y)
+    #     token_map[curr_img_token] = next_img_token
+
+    #     if idx == len(first_pass_coords) - 2:
+    #         last_img_token = next_img_token
+    #         token_map[last_img_token] = EmptyToken()
+    
     # autoregressive first pass
-    for idx in range(len(first_pass_coords) - 1):
+    for idx in range(1, len(first_pass_coords)):
+        prev_coords = first_pass_coords[idx - 1]
         curr_coords = first_pass_coords[idx]
-        next_coords = first_pass_coords[idx + 1]
 
+        prev_x, prev_y = prev_coords
         curr_x, curr_y = curr_coords
-        next_x, next_y = next_coords
 
+        prev_img_token = ImageToken(x_coord=prev_x, y_coord=prev_y)
         curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
-        next_img_token = ImageToken(x_coord=next_x, y_coord=next_y)
-        token_map[curr_img_token] = next_img_token
+        token_map[prev_img_token] = curr_img_token
 
-        if idx == len(first_pass_coords) - 2:
-            last_img_token = next_img_token
-            token_map[last_img_token] = EmptyToken()
+        # if idx == len(first_pass_coords) - 2:
+        #     last_img_token = next_img_token
+        #     token_map[last_img_token] = EmptyToken()
 
     # passes with learnable tokens
     for i_pass in range(1, len(masked_coords)):
@@ -176,14 +261,20 @@ def get_autoregressive_structure(
         for curr_coord in curr_coords:
             x, y = curr_coord
             curr_img_token = ImageToken(x_coord=x, y_coord=y)
-            closest_token = find_closest_token(
-                curr_img_token, generated_tokens, width
+            # closest_token = find_closest_token(
+            #     curr_img_token, generated_tokens, width
+            # )
+            # token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
+            lest_unattached_token = find_unattached_token(
+                token_map, curr_img_token, generated_tokens, width
             )
-            token_map[closest_token] = curr_img_token
+            token_map[lest_unattached_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
             
     decoded_masked_coords = autoregressive_first_step(masked_coords)
+    # print("decoded_masked_coords:", decoded_masked_coords) ##############################################
     
     return AutoRegressiveStructure(
+        logger=logger, ##############################################
         image_height=height,
         image_width=width,
         token_map=token_map,

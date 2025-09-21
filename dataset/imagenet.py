@@ -3,13 +3,15 @@ import numpy as np
 import os
 from torch.utils.data import Dataset
 from torchvision.datasets import ImageFolder
+from typing import Optional
 
 
 class CustomDataset(Dataset):
-    def __init__(self, feature_dir, label_dir, num_datapoints: int| None =None):
+    def __init__(self, feature_dir, label_dir, num_datapoints: Optional[int] = None, num_data: Optional[int] = None):
         self.feature_dir = feature_dir
         self.label_dir = label_dir
-        self.flip =  False # 'flip' in self.feature_dir
+        # self.flip =  False # 'flip' in self.feature_dir
+        self.flip = 'flip' in self.feature_dir
 
         aug_feature_dir = feature_dir.replace('ten_crop/', 'ten_crop_105/')
         aug_label_dir = label_dir.replace('ten_crop/', 'ten_crop_105/')
@@ -25,6 +27,10 @@ class CustomDataset(Dataset):
         if num_datapoints is not None:
             self.feature_files = [self.feature_files[i%num_datapoints] for i in range(len(self.feature_files))] # sample only num_datapoints files
             self.label_files = [self.label_files[i%num_datapoints] for i in range(len(self.label_files))] # sample only num_datapoints files
+        
+        if num_data is not None:
+            self.feature_files = self.feature_files[:num_data] # sample only first num_data files
+            self.label_files = self.label_files[:num_data] # sample only first num_data files
                 
     def __len__(self):
         assert len(self.feature_files) == len(self.label_files), \
@@ -38,7 +44,7 @@ class CustomDataset(Dataset):
         else:
             feature_dir = self.feature_dir
             label_dir = self.label_dir
-                   
+
         feature_file = self.feature_files[idx]
         label_file = self.label_files[idx]
 
@@ -60,6 +66,9 @@ def build_imagenet_code(args):
     feature_dir = f"{args.code_path}/imagenet{args.image_size}_codes"
     label_dir = f"{args.code_path}/imagenet{args.image_size}_labels"
     num_datapoints = args.num_datapoints
+    #############################################
+    num_data = args.num_data
+    #############################################
     assert os.path.exists(feature_dir) and os.path.exists(label_dir), \
         f"please first run: bash scripts/autoregressive/extract_codes_c2i.sh ..."
-    return CustomDataset(feature_dir, label_dir, num_datapoints)
+    return CustomDataset(feature_dir, label_dir, num_datapoints, num_data)

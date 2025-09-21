@@ -74,8 +74,7 @@ def main(args):
     precision = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.precision]
     latent_size = args.image_size // args.downsample_size
     gpt_model = GPT_models[args.gpt_model](
-        subpass_len=args.subpass_len,
-        subpass_num=args.subpass_num,
+        is_serial=args.is_serial,
         logger=None,
         vocab_size=args.codebook_size,
         block_size=latent_size ** 2,
@@ -100,19 +99,19 @@ def main(args):
     else:
         print(f"no model compile") 
 
-    # Create folder to save samples:
-    model_string_name = args.gpt_model.replace("/", "-")
-    if args.from_fsdp:
-        ckpt_string_name = args.gpt_ckpt.split('/')[-2]
-    else:
-        ckpt_string_name = os.path.basename(args.gpt_ckpt).replace(".pth", "").replace(".pt", "")
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size_eval}-{args.vq_model}-" \
-                  f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}--ABS-{args.adam_block_size}"
-    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-    if rank == 0:
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}")
+    # # Create folder to save samples:
+    # model_string_name = args.gpt_model.replace("/", "-")
+    # if args.from_fsdp:
+    #     ckpt_string_name = args.gpt_ckpt.split('/')[-2]
+    # else:
+    #     ckpt_string_name = os.path.basename(args.gpt_ckpt).replace(".pth", "").replace(".pt", "")
+    # folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size_eval}-{args.vq_model}-" \
+    #               f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
+    #               f"cfg-{args.cfg_scale}-seed-{args.global_seed}--ABS-{args.adam_block_size}"
+    # sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    # if rank == 0:
+    #     os.makedirs(sample_folder_dir, exist_ok=True)
+    #     print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
@@ -145,7 +144,7 @@ def main(args):
                         top_p=args.top_p)
         e_ARtime = time.time() ################################
         ARtime += (e_ARtime - s_ARtime) ################################
-        
+
         samples = vq_model.decode_code(index_sample, qzshape) # output value is between [-1, 1]
         if args.image_size_eval != args.image_size:
             samples = F.interpolate(samples, size=(args.image_size_eval, args.image_size_eval), mode='bicubic')
@@ -154,14 +153,14 @@ def main(args):
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            # Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
     end_time = time.time()
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
     if rank == 0:
-        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        # create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
         print(f"Total time for sampling {total} images: {end_time - start_t:.2f} seconds")
         print(f"Total time for AR: {ARtime:.2f} seconds")
