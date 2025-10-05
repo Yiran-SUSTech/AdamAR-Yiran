@@ -7,6 +7,7 @@ from jaxtyping import Float, Int64
 from dataclasses import dataclass
 
 from typing import Optional
+import copy
 
 @dataclass
 class AutoRegressiveStructure:
@@ -26,38 +27,11 @@ class AutoRegressiveStructure:
         self.token_map = token_map
         self.token_map_tensors = TokenMapTensors(token_map, image_width, image_height)   
         self._cond_len = self.token_map.cond_len
+        self.decoded_masked_coords = copy.deepcopy(decoded_masked_coords)
         
         self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords) # decoding_schedule其实是output token的index的list，也就是从0到total_len-1
         self.training_attention_mask = self.get_training_attention_mask(self.decoding_schedule)
-        
-        if dist.get_rank() == 0:
-            print(f"len(token_map): {len(token_map)}") ##############################################
-            num_output_image_tokens = 0
-            for i_pass, coords_i_pass in enumerate(decoded_masked_coords):
-                print(f"pass {i_pass}:")
-                coords_n_indics = []
-                for coord in coords_i_pass.tolist():
-                    x, y = coord
-                    output_token_index = self.token_map.get_output_token_index((ImageToken(x, y)))
-                    coords_n_indics.append([x,y,output_token_index])
-                print(coords_n_indics)
-                num_output_image_tokens += len(coords_i_pass.tolist())
-            print("^"*50)
-            print("input token and corresponding output token indices:")
-            print(f"total num input tokens: {len(self.token_map._input_index.keys())}")
-            total_input_image_tokens = 0
-            for inp_token in self.token_map._input_index.keys():
-                if inp_token.token_type() != TokenType.IMAGE:
-                    continue
-                output_token_indices = self.token_map._input_index[inp_token]
-                total_input_image_tokens += len(output_token_indices)
-                print(f"input token pos: [{inp_token.x_coord}, {inp_token.y_coord}] appeared {len(output_token_indices)} times in input sequence: {output_token_indices}")
-            print(f"total input image tokens: {total_input_image_tokens}")
-            print("^"*50)
-            print(f"num_output_image_tokens: {num_output_image_tokens}") ##############################################
-            print(f"Decoding schedule: {self.decoding_schedule}") ##############################################
-            print(f"training attention mask: {self.training_attention_mask}") ##############################################
-            print(f"shape of training attention mask: {self.training_attention_mask.shape}") ##############################################
+
         
     # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_input_tokens(
@@ -85,6 +59,10 @@ class AutoRegressiveStructure:
         cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
 
         image_indices = self.token_map_tensors.in_token_indices[image_mask]
+        assert len(image_indices) == num_total_tokens - cond_mask.sum(), (
+            "the number of image tokens in the input sequence should be equal to total tokens - condition tokens"
+        )
+
         reordered_image_tokens = image_tokens[:, image_indices, :]
 
         input_tokens[:, image_mask, :] = reordered_image_tokens
@@ -99,20 +77,10 @@ class AutoRegressiveStructure:
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
     ):
         in_img_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
-        in_con_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
-
         new_freqs_cis = torch.empty(in_img_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
-        cond_lenn = self.token_map.cond_len
 
-        new_freqs_cis[in_img_mask] = freqs_cis[
-            self.token_map_tensors.in_token_indices[in_img_mask]+cond_lenn 
-            # +cond_lenn is because the freqs_cis is of shape (cls_token_num+grid_size**2, head_dim // 2, 2)
-            # the first frequency for image token is freqs_cis[cond_lenn]
-        ]
-        new_freqs_cis[in_con_mask] = freqs_cis[
-            self.token_map_tensors.in_token_indices[in_con_mask]
-        ]
-        
+        new_freqs_cis = freqs_cis[:-1]
+
         return new_freqs_cis
     
     def assemble_target_tokens(
@@ -135,6 +103,9 @@ class AutoRegressiveStructure:
 
         image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
         empty_mask = self.token_map_tensors.out_token_types == TokenType.EMPTY.value
+        assert image_mask.sum() == len(self.token_map), (
+            "The number of image tokens in the output sequence should be equal to total tokens"
+        )
         assert (image_mask.int() + empty_mask.int() == 1).all(), (
             "Image and empty mask should be mutually exclusive"
         )

@@ -9,6 +9,14 @@ import torch.distributed as dist
 AXIS_ALIGNED_KEY = "axis_aligned"
 NONAXIS_ALIGNED_KEY = "nonaxis_aligned"
 
+Pre_TOKEN_FUNCTION = {
+    'close_min': find_close_min_token,
+    'close_max': find_close_max_token,
+    'close_unattach_min': find_close_unattach_min_token,
+    'close_unattach_max': find_close_unattach_max_token,
+    'close_left_up': find_close_left_up_token,
+}
+
 @dataclass
 class ShiftPattern:
     x_shift: int
@@ -79,21 +87,6 @@ def get_adam_pattern(
 
             patterns.append((x_start, y_start, x_stride, y_stride))
 
-    ####################################
-    if dist.get_rank() == 0:
-        print("#"*50)
-        print("Adam patterns (x_start, y_start, x_step, y_step):")
-        for i, pattern in enumerate(patterns):
-            print(f"Pass {i}: {pattern}")
-        print("Adam shift patterns:")
-        print("#"*50)
-        for i, shift_pattern in enumerate(shift_patterns):
-            print(f"Pass {i} shifts:")
-            for key, sp in shift_pattern.items():
-                print(f"  {key}: (x_shift={sp.x_shift}, y_shift={sp.y_shift})")
-        print("#"*50)
-    ####################################
-
     return patterns, shift_patterns
 
 
@@ -141,7 +134,10 @@ def set_subpass_by_len(adam_coords: list[torch.Tensor], subpass_len: int=1) -> l
             new_adam_coords.append(adam_coord)
             continue
         # if subpass length is 0, then, it is serial generation within each pass
-        autoregressive_n_step = adam_coord.split(subpass_len, dim=0)
+        assert len(adam_coord) % subpass_len == 0, "Each pass length must be divisible by subpass_len"
+        tmp = adam_coord.reshape(-1, subpass_len, 2)
+        tmp = tmp.transpose(0,1).reshape(-1, 2)
+        autoregressive_n_step = tmp.split(len(adam_coord) // subpass_len, dim=0)
         new_adam_coords += list(autoregressive_n_step)
     
     return new_adam_coords
@@ -168,12 +164,13 @@ def get_autoregressive_structure(
     cond_len: int,
     subpass_len: int=None, # subpass_len==1 means serial generation within each pass
     subpass_num: int=None,
+    pre_token_choose: str="close_min",
 ) -> AutoRegressiveStructure:
     _, masked_coords, _ = generalized_adam_interlacing(width, height, base_block_size)
     total_len = width * height + cond_len
 
     #########################################
-    assert (subpass_len is None) or (subpass_num is None), "Only one of subpass_len and subpass_num should be set"
+    assert (subpass_len is None) or (subpass_num is None), "Only one of subpass_len and subpass_num can be set"
     if subpass_len is not None:
         masked_coords = set_subpass_by_len(masked_coords, subpass_len)
     if subpass_num is not None:
@@ -220,22 +217,6 @@ def get_autoregressive_structure(
             token_map[cond_token] = first_image_token
         else:
             token_map[cond_token] = EmptyToken()
-
-    # # autoregressive first pass
-    # for idx in range(len(first_pass_coords) - 1):
-    #     curr_coords = first_pass_coords[idx]
-    #     next_coords = first_pass_coords[idx + 1]
-
-    #     curr_x, curr_y = curr_coords
-    #     next_x, next_y = next_coords
-
-    #     curr_img_token = ImageToken(x_coord=curr_x, y_coord=curr_y)
-    #     next_img_token = ImageToken(x_coord=next_x, y_coord=next_y)
-    #     token_map[curr_img_token] = next_img_token
-
-    #     if idx == len(first_pass_coords) - 2:
-    #         last_img_token = next_img_token
-    #         token_map[last_img_token] = EmptyToken()
     
     # autoregressive first pass
     for idx in range(1, len(first_pass_coords)):
@@ -261,15 +242,14 @@ def get_autoregressive_structure(
         for curr_coord in curr_coords:
             x, y = curr_coord
             curr_img_token = ImageToken(x_coord=x, y_coord=y)
-            # closest_token = find_closest_token(
-            #     curr_img_token, generated_tokens, width
-            # )
-            # token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
-            lest_unattached_token = find_unattached_token(
+
+            closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
                 token_map, curr_img_token, generated_tokens, width
             )
-            token_map[lest_unattached_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
-            
+            if dist.get_rank() == 0:
+                print(f"closest previous token: ({closest_token.x_coord}, {closest_token.y_coord}), Current token: ({curr_img_token.x_coord}, {curr_img_token.y_coord})")
+            token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
+
     decoded_masked_coords = autoregressive_first_step(masked_coords)
     # print("decoded_masked_coords:", decoded_masked_coords) ##############################################
     

@@ -35,6 +35,7 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
+from autoregressive.models.utils.visulization import *
 from tokenizer.tokenizer_image.vq_model import VQ_models
 
 import torch._dynamo
@@ -208,7 +209,47 @@ def main(args):
         drop_path_rate=args.drop_path_rate,
         token_dropout_p=args.token_dropout_p,
         adam_block_size=args.adam_block_size,
+        pre_token_choose=args.pre_token_choose,
     ).to(device)
+
+    # visualize passes and attention mask
+    if rank == 0:
+        visualize_passes(
+            img_width = int(model.block_size ** 0.5),
+            img_height = int(model.block_size ** 0.5),
+            token_map=model.auto_regr_struct.token_map,
+            decoded_masked_coords=model.auto_regr_struct.decoded_masked_coords,
+            experiment_dir=experiment_dir
+        )
+        visualize_input_seq(
+            img_width = int(model.block_size ** 0.5),
+            img_height = int(model.block_size ** 0.5),
+            token_map=model.auto_regr_struct.token_map,
+            token_map_tensors=model.auto_regr_struct.token_map_tensors,
+            decoded_masked_coords=model.auto_regr_struct.decoded_masked_coords,
+            experiment_dir=experiment_dir
+        )
+        visualize_target_seq(
+            img_width = int(model.block_size ** 0.5),
+            img_height = int(model.block_size ** 0.5),
+            token_map=model.auto_regr_struct.token_map,
+            token_map_tensors=model.auto_regr_struct.token_map_tensors,
+            decoded_masked_coords=model.auto_regr_struct.decoded_masked_coords,
+            experiment_dir=experiment_dir
+        )
+        visualize_attention_mask(
+            attention_mask=model.auto_regr_struct.training_attention_mask,
+            experiment_dir=experiment_dir
+        )
+        visualize_sequences(
+            img_width = int(model.block_size ** 0.5),
+            img_height = int(model.block_size ** 0.5),
+            token_map=model.auto_regr_struct.token_map,
+            token_map_tensors=model.auto_regr_struct.token_map_tensors,
+            decoded_masked_coords=model.auto_regr_struct.decoded_masked_coords,
+            experiment_dir=experiment_dir
+        )
+
 
     if args.is_wandb_log:
         # if we want to log images to wandb, we need to setup VQ model
@@ -443,7 +484,7 @@ if __name__ == "__main__":
     parser.add_argument("--is-wandb-log", action='store_true')
     parser.add_argument("--wandb_offline", action='store_true')
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
-    parser.add_argument("--mixed-precision", type=str, default='fp16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     parser.add_argument("--num-data", type=int, default=None, help="number of data points to train on") # sample only first num_data files
     parser.add_argument("--from_llamagen", action='store_true')
@@ -459,6 +500,7 @@ if __name__ == "__main__":
     parser.add_argument("--is-lr-scheduler", action='store_true')
     parser.add_argument("--subpass-len", type=int, default=None, help="the length of each subpass, None means no subpass")
     parser.add_argument("--subpass-num", type=int, default=None, help="the number of subpasses within each pass, None means no subpass")
+    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'close_unattach_min', 'close_unattach_max', 'close_left_up'], default="close_min")
 
     args = parser.parse_args()
     main(args)

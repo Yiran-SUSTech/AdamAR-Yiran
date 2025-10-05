@@ -27,6 +27,7 @@ if project_root_dir not in sys.path:
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate import generate
+from utils.logger import create_logger
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -60,6 +61,30 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    # Create folder to save samples:
+    model_string_name = args.gpt_model.replace("/", "-")
+    if args.from_fsdp:
+        ckpt_string_name = args.gpt_ckpt.split('/')[-2]
+    else:
+        ckpt_string_name = os.path.basename(args.gpt_ckpt).replace(".pth", "").replace(".pt", "")
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size_eval}-{args.vq_model}-" \
+                  f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
+                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}--ABS-{args.adam_block_size}"
+    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    if rank == 0:
+        os.makedirs(sample_folder_dir, exist_ok=True)
+        print(f"Saving .png samples at {sample_folder_dir}")
+
+    # create logger
+    if rank == 0:
+        logger = create_logger(sample_folder_dir)
+        logger.info(f"logger directory created at {sample_folder_dir}")
+    else:
+        logger = create_logger(None)  # Create a logger that does not write to file
+
+    logger.info(f"Args: {args}")
+    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+
     # create and load model
     vq_model = VQ_models[args.vq_model](
         codebook_size=args.codebook_size,
@@ -76,13 +101,14 @@ def main(args):
     gpt_model = GPT_models[args.gpt_model](
         subpass_len=args.subpass_len,
         subpass_num=args.subpass_num,
-        logger=None,
+        logger=logger,
         vocab_size=args.codebook_size,
         block_size=latent_size ** 2,
         num_classes=args.num_classes,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
         adam_block_size=args.adam_block_size,
+        pre_token_choose=args.pre_token_choose,
     ).to(device=device, dtype=precision)
     
     checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
@@ -100,19 +126,6 @@ def main(args):
     else:
         print(f"no model compile") 
 
-    # Create folder to save samples:
-    model_string_name = args.gpt_model.replace("/", "-")
-    if args.from_fsdp:
-        ckpt_string_name = args.gpt_ckpt.split('/')[-2]
-    else:
-        ckpt_string_name = os.path.basename(args.gpt_ckpt).replace(".pth", "").replace(".pt", "")
-    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-size-{args.image_size_eval}-{args.vq_model}-" \
-                  f"topk-{args.top_k}-topp-{args.top_p}-temperature-{args.temperature}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}--ABS-{args.adam_block_size}"
-    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
-    if rank == 0:
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
@@ -177,7 +190,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
     parser.add_argument("--from-fsdp", action='store_true')
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
-    parser.add_argument("--precision", type=str, default='fp16', choices=["none", "fp16", "bf16"]) 
+    parser.add_argument("--precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--compile", action='store_true', default=True)
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
@@ -199,6 +212,7 @@ if __name__ == "__main__":
     parser.add_argument("--adam-block-size", type=int, choices=[1,2,4,8,16], default=8)
     parser.add_argument("--subpass-len", type=int, default=None, help="the length of each subpass, None means no subpass")
     parser.add_argument("--subpass-num", type=int, default=None, help="the number of subpasses within each pass, None means no subpass")
+    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'close_unattach_min', 'close_unattach_max', 'close_left_up'], default="close_min")
 
     args = parser.parse_args()
     main(args)

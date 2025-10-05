@@ -90,7 +90,7 @@ class TokenMap:
         )
         self._output_index[out_token] = len(self._data) - 1
         if isinstance(in_token, ConditionToken):
-            self._cond_len +=1
+            self._cond_len += 1
     
     def __getitem__(self, in_token: Token):
         # Return all matches for the given in_token
@@ -158,6 +158,10 @@ class TokenMapTensors:
                 assert False, (
                     "Condition or learnable token should not be in output token map"
                 )
+            else:
+                assert False, (
+                    f"Unknown output token type: {in_token_type}"
+                )
                 
             in_token_type = in_token.token_type()
             if in_token_type == TokenType.IMAGE or in_token_type == TokenType.LEARNED:
@@ -169,36 +173,11 @@ class TokenMapTensors:
             elif in_token_type == TokenType.CONDITION:
                 self.in_token_indices[idx] = in_token.cond_index
                 self.in_token_types[idx] = in_token_type.value
+            else:
+                assert False, (f"Unknown input token type: {in_token_type}")
 
 
-def find_closest_token(
-    query_token: SpatialToken, 
-    candidate_tokens: Sequence[SpatialToken],
-    image_width: int
-) -> SpatialToken:
-    # If there are multiple closest tokens, return the one with the smallest index
-    if len(candidate_tokens) == 0:
-        raise ValueError("No candidate tokens provided")
-    
-    min_dist = float("inf")
-    closest_token = None
-    closest_index = float("inf") 
-    # closest_index = -1000000 # for max index
-    
-    for token in candidate_tokens:
-        dist = spatial_token_distance(query_token, token)
-        index = token.image_index(image_width)
-
-        if dist < min_dist or (dist == min_dist and index < closest_index):
-        # if dist < min_dist or (dist == min_dist and index > closest_index): # for max index
-            min_dist = dist
-            closest_token = token
-            closest_index = index
-
-    assert closest_token is not None, "No closest token found"
-    return closest_token
-
-def find_unattached_token(
+def find_close_min_token(
     token_map: TokenMap,
     query_token: SpatialToken, 
     candidate_tokens: Sequence[SpatialToken],
@@ -208,23 +187,144 @@ def find_unattached_token(
     if len(candidate_tokens) == 0:
         raise ValueError("No candidate tokens provided")
     
-    lest_attached_token = None
     min_dist = float("inf")
-    lest_attached_index = -1000000 #####################
-    lest_attached_times = float("inf")
+    closest_min_token = None
+    closest_min_index = float("inf") 
     
     for token in candidate_tokens:
         dist = spatial_token_distance(query_token, token)
         index = token.image_index(image_width)
-        attached_times = len(token_map._input_index[token])
 
-        if attached_times < lest_attached_times or \
-            (attached_times == lest_attached_times and dist < min_dist) or \
-            (attached_times == lest_attached_times and dist == min_dist and index < lest_attached_index): ###############
+        if dist < min_dist or (dist == min_dist and index < closest_min_index):
+            min_dist = dist
+            closest_min_token = token
+            closest_min_index = index
+
+    assert closest_min_token is not None, "No closest token found"
+    return closest_min_token
+
+def find_close_max_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    min_dist = float("inf")
+    closest_max_token = None
+    closest_max_index = -1000000 
+    
+    for token in candidate_tokens:
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+
+        if dist < min_dist or (dist == min_dist and index > closest_max_index): 
+            min_dist = dist
+            closest_max_token = token
+            closest_max_index = index
+
+    assert closest_max_token is not None, "No closest token found"
+    return closest_max_token
+
+def find_close_unattach_min_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    close_unattach_min_token = None
+    min_dist = float("inf")
+    close_unattach_min_index = 10000000
+    close_unattach_min_outseq_index = 10000000
+    lest_attached_times = float("inf")
+    
+    for index_outseq, token in enumerate(candidate_tokens):
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+        if token not in token_map._input_index.keys():
+            attached_times = 0
+        else:
+            attached_times = len(token_map._input_index[token])
+
+        if dist < min_dist or \
+                (dist == min_dist and attached_times < lest_attached_times) or \
+                (dist == min_dist and attached_times == lest_attached_times and index_outseq < close_unattach_min_outseq_index): ###############
             lest_attached_times = attached_times
-            lest_attached_token = token
-            lest_attached_index = index
+            close_unattach_min_token = token
+            close_unattach_min_outseq_index = index_outseq
             min_dist = dist
 
-    assert lest_attached_token is not None, "No closest token found"
-    return lest_attached_token
+    assert close_unattach_min_token is not None, "No closest token found"
+    return close_unattach_min_token
+
+
+def find_close_unattach_max_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    close_unattach_max_token = None
+    min_dist = float("inf")
+    close_unattach_max_index = -10000000
+    close_unattach_max_outseq_index = -10000000
+    lest_attached_times = float("inf")
+    
+    for index_outseq, token in enumerate(candidate_tokens):
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+        if token not in token_map._input_index.keys():
+            attached_times = 0
+        else:
+            attached_times = len(token_map._input_index[token])
+
+        if dist < min_dist or \
+                (dist == min_dist and attached_times < lest_attached_times) or \
+                (dist == min_dist and attached_times == lest_attached_times and index_outseq > close_unattach_max_outseq_index): ###############
+            lest_attached_times = attached_times
+            close_unattach_max_token = token
+            close_unattach_max_outseq_index = index_outseq
+            min_dist = dist
+
+    assert close_unattach_max_token is not None, "No closest token found"
+    return close_unattach_max_token
+
+
+def find_close_left_up_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one with the smallest index
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    close_left_up_token = None
+    min_dist = float("inf")
+    close_left_up_index = -10000000
+    close_left_up_outseq_index = -10000000
+    
+    for index_outseq, token in enumerate(candidate_tokens):
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+        if dist < min_dist or \
+                (dist == min_dist and token.x_coord < query_token.x_coord) or \
+                (dist == min_dist and token.x_coord == query_token.x_coord and token.y_coord < query_token.y_coord): ###############
+            close_left_up_token = token
+            close_left_up_outseq_index = index_outseq
+            min_dist = dist
+
+    assert close_left_up_token is not None, "No closest token found"
+    return close_left_up_token

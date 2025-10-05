@@ -7,6 +7,7 @@
 #   PixArt:   https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
 from dataclasses import dataclass
 from typing import Optional, List
+import logging
 
 
 import torch
@@ -18,6 +19,8 @@ from autoregressive.models.utils.tokens import TokenType
 from autoregressive.models.generate import sample
 from autoregressive.models.utils.adam import get_autoregressive_structure
 from torch.nn.attention import sdpa_kernel, SDPBackend
+
+from autoregressive.models.utils.visulization import *
 
 import numpy as np
 
@@ -61,8 +64,10 @@ class ModelArgs:
     adam_block_size: int = 8
     subpass_len: int = None  # divide each pass into several subpasses, each subpass has subpass_len tokens
     subpass_num: int = None  # divide each pass into several subpasses, each pass has subpass_num subpasses
-    logger: Optional[object] = None
+    logger: Optional[logging.Logger] = None
     is_random: bool = False  # whether to use random attention mask for training and generation
+    sample_folder_dir: str = "samples"
+    pre_token_choose: str = "close_min"  # how to choose the pre-token for each token, options: close_min, close_max, close_unattach_min, close_unattach_max
 
 
 #################################################################################
@@ -300,6 +305,8 @@ class Transformer(nn.Module):
         self.subpass_len = config.subpass_len
         self.subpass_num = config.subpass_num
         self.is_random = config.is_random # randomly reorder the tokens within each pass
+        self.sample_folder_dir = config.sample_folder_dir
+        self.pre_token_choose = config.pre_token_choose
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -317,7 +324,8 @@ class Transformer(nn.Module):
         self.auto_regr_struct = get_autoregressive_structure(width=width, height=height, 
                                                              base_block_size=config.adam_block_size, 
                                                              cond_len=config.cls_token_num, 
-                                                             logger=self.logger, subpass_len=self.subpass_len, subpass_num=self.subpass_num)
+                                                             logger=self.logger, subpass_len=self.subpass_len, subpass_num=self.subpass_num,
+                                                             pre_token_choose=self.pre_token_choose)
         self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
         
         
@@ -403,20 +411,14 @@ class Transformer(nn.Module):
         """
 
         # TODO: add support for KV cache using input_pos 
-        # if dist.get_rank() == 0:
-        #     print("^"*50)
-        #     print(f"input_pos inside forward_inference: {input_pos}")
-        #     print(f"x.shape inside forward_inference: {x.shape}")
-        #     print(f"freqs_cis.shape inside forward_inference: {freqs_cis.shape}")
-        #     print("^"*50)
+
         
         assert self.auto_regr_struct.training_attention_mask is not None
         # mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
         mask = self.causal_mask[:x.shape[0], None, input_pos].to(x.device)
         h = x
         for layer in self.layers:
-            # h = layer(h, freqs_cis, start_pos=input_pos, mask=self.causal_mask)
-            h = layer(h, freqs_cis, start_pos=input_pos, mask=mask)
+            h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
         h = self.norm(h)
         logits = self.output(h).float()
         return logits
@@ -438,12 +440,6 @@ class Transformer(nn.Module):
         
         assert self.auto_regr_struct.training_attention_mask is not None
 
-        # if dist.get_rank() == 0:
-        #     print('#'*50)
-        #     print(f'shape of h: {h.shape}')
-        #     print(f'shape of assem_freqs_cis: {assem_freqs_cis.shape}')
-        #     print(f'shape of self.freqs_cis: {self.freqs_cis.shape}')
-        #     print('#'*50)
 
         for layer in self.layers:
             h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.training_attention_mask.to(h.device))
@@ -496,7 +492,7 @@ class Transformer(nn.Module):
             
         # TODO: add support for KV cache (below code is from RandAR)
         # Step-4: KV Cache setup
-        max_seq_len = cond_combined_tokens.shape[1] + self.block_size
+        max_seq_len = self.block_size
         with torch.device(cond_idx.device):
             self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
         
@@ -518,8 +514,7 @@ class Transformer(nn.Module):
                 input_token_type = input_token.token_type()
                 
                 if input_token_type == TokenType.IMAGE:
-                    tmp = output_token_config[input_token]
-                    # next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
+                    tmp = output_token_config[input_token] # tmp是前序token在output tokens中的位置
                     img_emb = self.tok_embeddings(decoded_indices[:, tmp])   # [bs, dim]
                     if cfg_scales[-1] > 1.0:
                         img_emb = torch.cat([img_emb, img_emb], dim=0)       # [2*bs, dim]
@@ -533,19 +528,14 @@ class Transformer(nn.Module):
                     
                 
 
-            # x = torch.cat([x, next_embeddings], dim=1)
-            # input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
-            # freqs_cis = assembled_freq_cis[input_pos]
             input_pos = torch.tensor(next_decoded_token_group, device=cond_idx.device)
             freqs_cis = assembled_freq_cis[input_pos]
-        
-            # assert x.shape[1] == freqs_cis.shape[0]
+
             assert next_embeddings.shape[1] == freqs_cis.shape[0]
 
             decoded_token_group = decoding_schedule[decoding_step]
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
-            # logits = self.forward_inference(x, freqs_cis, input_pos)
             with sdpa_kernel(SDPBackend.MATH):
                 logits = self.forward_inference(next_embeddings, freqs_cis, input_pos)
             if cfg_scales[-1] > 1.0:
