@@ -76,11 +76,17 @@ class AutoRegressiveStructure:
         self,
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
     ):
-        in_img_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
-        new_freqs_cis = torch.empty(in_img_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
+        image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
+        new_freqs_cis = torch.empty(image_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
+        cond_lenn = self.token_map.cond_len
+        
+        out_image_indices = self.token_map_tensors.out_token_indices[image_mask] + cond_lenn
+        reordered_freqs_cis = freqs_cis[
+            out_image_indices, :, :
+        ]
 
-        new_freqs_cis = freqs_cis[:-1]
-
+        new_freqs_cis[:, :, :] = reordered_freqs_cis
+        
         return new_freqs_cis
     
     def assemble_target_tokens(
