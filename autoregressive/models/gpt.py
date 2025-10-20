@@ -23,6 +23,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from autoregressive.models.utils.visulization import *
 
 import numpy as np
+import math
 
 def split_list(lst, chunk_size):
     return [lst[i:i + chunk_size] for i in range(0, len(lst), chunk_size)]
@@ -68,6 +69,9 @@ class ModelArgs:
     is_random: bool = False  # whether to use random attention mask for training and generation
     sample_folder_dir: str = "samples"
     pre_token_choose: str = "close_min"  # how to choose the pre-token for each token, options: close_min, close_max, close_unattach_min, close_unattach_max
+    freqs_cis_reorder_shceme: str = None # how to reorder the freqs_cis for position embedding
+    interlacing_type: str = "adam"  # interlacing type, options: adam, spin_adam
+    target_aware_emb: bool = False  # whether to use target-aware embedding
 
 
 #################################################################################
@@ -307,6 +311,9 @@ class Transformer(nn.Module):
         self.is_random = config.is_random # randomly reorder the tokens within each pass
         self.sample_folder_dir = config.sample_folder_dir
         self.pre_token_choose = config.pre_token_choose
+        self.freqs_cis_reorder_shceme = config.freqs_cis_reorder_shceme
+        self.interlacing_type = config.interlacing_type
+        self.target_aware_emb = config.target_aware_emb  # whether to use target-aware embedding
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -325,9 +332,10 @@ class Transformer(nn.Module):
                                                              base_block_size=config.adam_block_size, 
                                                              cond_len=config.cls_token_num, 
                                                              logger=self.logger, subpass_len=self.subpass_len, subpass_num=self.subpass_num,
-                                                             pre_token_choose=self.pre_token_choose)
+                                                             pre_token_choose=self.pre_token_choose,
+                                                             freqs_cis_reorder_shceme=self.freqs_cis_reorder_shceme,
+                                                             interlacing_type=self.interlacing_type)
         self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
-        
         
         # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
@@ -343,8 +351,10 @@ class Transformer(nn.Module):
         grid_size = int(self.block_size ** 0.5)
         assert grid_size * grid_size == self.block_size
         self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
-        # if dist.get_rank() == 0:
-        #     print(f"self.freqs_cis.shape: {self.freqs_cis.shape}")
+        # Sinusoidal pos embedding for next-token prediction
+        self.SinusoidalPosEmb = precompute_SinusoidalPosEmb(grid_size=grid_size, dim=self.config.dim, cls_token_num=self.cls_token_num)
+        self.assemble_SinusoidalPosEmb = self.auto_regr_struct.assemble_sinusoidal_positional_embedding(self.SinusoidalPosEmb)
+
         # KVCache
         self.max_batch_size = -1
         self.max_seq_length = -1
@@ -383,9 +393,6 @@ class Transformer(nn.Module):
         grid_size = int(grid_size)
         causal_mask[:grid_size, :grid_size] = self.auto_regr_struct.training_attention_mask
         self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        # grid_size = int(self.config.block_size ** 0.5)
-        # assert grid_size * grid_size == self.block_size
-        # self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
 
     def forward(
         self, 
@@ -403,7 +410,8 @@ class Transformer(nn.Module):
     def forward_inference(self, 
                           x: torch.Tensor, 
                           freqs_cis: torch.Tensor, 
-                          input_pos: torch.Tensor):
+                          input_pos: torch.Tensor,
+                          pass_i: int = None):
         """ Args:
             x: [bs, query_num, dim] Input tokens
             freqs_cis: [bs, query_num, n_head, dim // n_head] Frequency embeddings
@@ -414,9 +422,11 @@ class Transformer(nn.Module):
 
         
         assert self.auto_regr_struct.training_attention_mask is not None
-        # mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
         mask = self.causal_mask[:x.shape[0], None, input_pos].to(x.device)
+
         h = x
+        if self.target_aware_emb:
+            h = h + self.assemble_SinusoidalPosEmb[input_pos].unsqueeze(0).to(h.device)
         for layer in self.layers:
             h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
         h = self.norm(h)
@@ -437,6 +447,8 @@ class Transformer(nn.Module):
         assem_input_embeddings, assem_freqs_cis = self.auto_regr_struct.assemble_input_tokens(token_embeddings, cond_embeddings, self.learnable_pos_embedding, self.freqs_cis.to(idx.device))
 
         h = self.tok_dropout(assem_input_embeddings)
+        if self.target_aware_emb:
+            h = h + self.assemble_SinusoidalPosEmb.unsqueeze(0).to(h.device)
         
         assert self.auto_regr_struct.training_attention_mask is not None
 
@@ -488,6 +500,8 @@ class Transformer(nn.Module):
     
         cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
         x = torch.empty([bs, 0, self.config.dim], device=cond_idx.device, dtype=cond_combined_tokens.dtype)
+        if self.target_aware_emb:
+            self.assemble_SinusoidalPosEmb = self.assemble_SinusoidalPosEmb.to(device=cond_idx.device, dtype=cond_combined_tokens.dtype)
         input_pos = torch.empty(0, device=cond_idx.device, dtype=torch.long)
             
         # TODO: add support for KV cache (below code is from RandAR)
@@ -537,7 +551,7 @@ class Transformer(nn.Module):
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
             with sdpa_kernel(SDPBackend.MATH):
-                logits = self.forward_inference(next_embeddings, freqs_cis, input_pos)
+                logits = self.forward_inference(next_embeddings, freqs_cis, input_pos, pass_i=decoding_step)
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
@@ -554,6 +568,7 @@ class Transformer(nn.Module):
             
         
         image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
+        assert image_mask.sum() == self.block_size
         decoded_indices = decoded_indices[:, image_mask]
 
         _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
@@ -601,17 +616,29 @@ def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_
     #     print("*"*50)
     return cond_cache 
 
+def precompute_SinusoidalPosEmb(grid_size: int, dim: int, cls_token_num=120):
+    seq_len = grid_size ** 2
+
+    # for cls tokens, the sinusoidal pos emb is zero
+    cls_pe = torch.zeros(cls_token_num, dim)
+
+    position = torch.arange(seq_len).unsqueeze(1)
+    div_term = torch.exp(
+            torch.arange(0, dim, 2) * (- math.log(10000.0) / dim)
+        )
+    angles = position * div_term
+    # shape of pe: [seq_len, dim]
+    pe = torch.zeros(seq_len, dim)
+    pe[:, 0::2] = torch.sin(angles)
+    pe[:, 1::2] = torch.cos(angles)
+    final_pe = torch.cat([cls_pe, pe], dim=0) # shape of final_pe: [seq_len + cls_token_num, dim]
+
+    return final_pe
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
-    # if dist.get_rank() == 0:
-    #     print("#"*50)
-    #     print(f"freqs_cis.shape inside apply_rotary_emb: {freqs_cis.shape}")
-    #     print(f"x.shape inside apply_rotary_emb: {x.shape}")
-    #     print(f"so according to x, bs: {x.shape[0]}, seq_len: {x.shape[1]}, n_head: {x.shape[2]}, head_dim: {x.shape[3]}")
-    #     print(f"and according to freqs_cis, seq_len: {freqs_cis.shape[0]}, head_dim // 2: {freqs_cis.shape[1]}")
-    #     print("#"*50)
+
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
     x_out2 = torch.stack([

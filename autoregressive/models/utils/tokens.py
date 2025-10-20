@@ -42,6 +42,16 @@ class SpatialToken(Token):
 
     def image_index(self, image_width: int) -> int:
         return self.y_coord * image_width + self.x_coord
+    
+    def token_quadrants(self, image_width: int, image_height: int) -> int:
+        if self.x_coord < image_width / 2 and self.y_coord < image_height / 2:
+            return 0  # Top-left
+        elif self.x_coord >= image_width / 2 and self.y_coord < image_height / 2:
+            return 1  # Top-right
+        elif self.x_coord < image_width / 2 and self.y_coord >= image_height / 2:
+            return 2  # Bottom-left
+        else:
+            return 3  # Bottom-right
 
 
 def spatial_token_distance(token: SpatialToken, other: SpatialToken, type: str="manhattan") -> float:
@@ -307,7 +317,7 @@ def find_close_left_up_token(
     candidate_tokens: Sequence[SpatialToken],
     image_width: int
 ) -> SpatialToken:
-    # If there are multiple closest tokens, return the one with the smallest index
+    # If there are multiple closest tokens, return the one which is closest to the left up corner of the image
     if len(candidate_tokens) == 0:
         raise ValueError("No candidate tokens provided")
     
@@ -328,3 +338,41 @@ def find_close_left_up_token(
 
     assert close_left_up_token is not None, "No closest token found"
     return close_left_up_token
+
+
+def find_close_center_token(
+    token_map: TokenMap,
+    query_token: SpatialToken, 
+    candidate_tokens: Sequence[SpatialToken],
+    image_width: int
+) -> SpatialToken:
+    # If there are multiple closest tokens, return the one which is closest to the center of the image
+    if len(candidate_tokens) == 0:
+        raise ValueError("No candidate tokens provided")
+    
+    close_center_token = None
+    min_dist = float("inf")
+    close_center_index = -10000000
+    close_center_outseq_index = -10000000
+
+    query_token_quadrant = query_token.token_quadrants(image_width, image_width) # Assuming square image for simplicity
+    close_center_x = -1
+    close_center_y = -1
+    
+    for index_outseq, token in enumerate(candidate_tokens):
+        dist = spatial_token_distance(query_token, token)
+        index = token.image_index(image_width)
+        if dist < min_dist or \
+                (dist == min_dist and query_token_quadrant == 0 and (token.x_coord >= close_center_x and token.y_coord >= close_center_y)) or \
+                (dist == min_dist and query_token_quadrant == 1 and (token.x_coord <= close_center_x and token.y_coord >= close_center_y)) or \
+                (dist == min_dist and query_token_quadrant == 2 and (token.x_coord >= close_center_x and token.y_coord <= close_center_y)) or \
+                (dist == min_dist and query_token_quadrant == 3 and (token.x_coord <= close_center_x and token.y_coord <= close_center_y)): ###############
+            close_center_token = token
+            close_center_index = index
+            close_center_outseq_index = index_outseq
+            close_center_x = token.x_coord
+            close_center_y = token.y_coord
+            min_dist = dist
+
+    assert close_center_token is not None, "No closest token found"
+    return close_center_token

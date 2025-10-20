@@ -21,7 +21,9 @@ class AutoRegressiveStructure:
                  image_width: int,
                  image_height: int,
                  token_map: TokenMap,
-                 decoded_masked_coords: list[torch.Tensor]):
+                 decoded_masked_coords: list[torch.Tensor],
+                 freqs_cis_reorder_shceme: str = None,
+                 ):
         self.logger = logger ##############################################
       
         self.token_map = token_map
@@ -31,8 +33,8 @@ class AutoRegressiveStructure:
         
         self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords) # decoding_schedule其实是output token的index的list，也就是从0到total_len-1
         self.training_attention_mask = self.get_training_attention_mask(self.decoding_schedule)
-
-        
+        self.freqs_cis_reorder_shceme = freqs_cis_reorder_shceme
+          
     # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_input_tokens(
         self,
@@ -76,18 +78,53 @@ class AutoRegressiveStructure:
         self,
         freqs_cis: Float[torch.Tensor, "total_len _ 2"],
     ):
-        image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
-        new_freqs_cis = torch.empty(image_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
+        out_image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
+        inp_image_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        inp_cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+        new_freqs_cis = torch.empty(out_image_mask.shape[0], freqs_cis.shape[1], freqs_cis.shape[2], device=freqs_cis.device)
         cond_lenn = self.token_map.cond_len
+        assert freqs_cis.shape[0] - cond_lenn == out_image_mask.shape[0], (
+            "The length of freqs_cis - cond_lenn should match the total number of output tokens (total length of the output sequence)"
+        )
         
-        out_image_indices = self.token_map_tensors.out_token_indices[image_mask] + cond_lenn
-        reordered_freqs_cis = freqs_cis[
-            out_image_indices, :, :
-        ]
-
-        new_freqs_cis[:, :, :] = reordered_freqs_cis
+        if self.freqs_cis_reorder_shceme == 'output_reorder':
+            out_image_indices = self.token_map_tensors.out_token_indices[out_image_mask] + cond_lenn
+            new_freqs_cis = freqs_cis[
+                out_image_indices, :, :
+            ]
+        elif self.freqs_cis_reorder_shceme == 'input_reorder':
+            inp_image_indices = self.token_map_tensors.in_token_indices[inp_image_mask] + cond_lenn
+            inp_cond_indices = self.token_map_tensors.in_token_indices[inp_cond_mask]
+            new_freqs_cis[inp_image_mask] = freqs_cis[inp_image_indices]
+            new_freqs_cis[inp_cond_mask] = freqs_cis[inp_cond_indices]
+        elif self.freqs_cis_reorder_shceme == 'None':
+            new_freqs_cis = freqs_cis[:-1]
+        else:
+            assert False, f"Unknown freqs_cis_reorder_shceme: {self.freqs_cis_reorder_shceme}"
         
         return new_freqs_cis
+    
+    def assemble_sinusoidal_positional_embedding(
+        self,
+        SinusoidalPosEmb: Float[torch.Tensor, "total_len _ dim"],
+    ):
+        out_image_mask = self.token_map_tensors.out_token_types == TokenType.IMAGE.value
+        inp_image_mask = self.token_map_tensors.in_token_types == TokenType.IMAGE.value
+        inp_cond_mask = self.token_map_tensors.in_token_types == TokenType.CONDITION.value
+
+        new_SinusoidalPosEmb = torch.empty(out_image_mask.shape[0], SinusoidalPosEmb.shape[1], device=SinusoidalPosEmb.device)
+        cond_lenn = self.token_map.cond_len
+        assert SinusoidalPosEmb.shape[0] - cond_lenn == out_image_mask.shape[0], (
+            "The length of SinusoidalPosEmb - cond_lenn should match the total number of output tokens (total length of the output sequence)"
+        )
+        
+        out_image_indices = self.token_map_tensors.out_token_indices[out_image_mask] + cond_lenn
+        if dist.get_rank() == 0:
+            print(f"out_image_indices.shape: {out_image_indices.shape}") ##############################################
+            print(f"out_image_indices: {out_image_indices}") ##############################################
+        new_SinusoidalPosEmb = SinusoidalPosEmb[out_image_indices]
+        
+        return new_SinusoidalPosEmb
     
     def assemble_target_tokens(
         self,
