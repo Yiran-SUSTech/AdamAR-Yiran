@@ -109,6 +109,10 @@ def main(args):
         model_type=args.gpt_type,
         adam_block_size=args.adam_block_size,
         pre_token_choose=args.pre_token_choose,
+        freqs_cis_reorder_shceme=args.freqs_cis_reorder_shceme,
+        interlacing_type=args.interlacing_type,
+        target_aware_emb=args.target_aware_emb,
+        is_adaLN=args.is_adaLN,
     ).to(device=device, dtype=precision)
     
     checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
@@ -212,7 +216,13 @@ if __name__ == "__main__":
     parser.add_argument("--adam-block-size", type=int, choices=[1,2,4,8,16], default=8)
     parser.add_argument("--subpass-len", type=int, default=None, help="the length of each subpass, None means no subpass")
     parser.add_argument("--subpass-num", type=int, default=None, help="the number of subpasses within each pass, None means no subpass")
-    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'close_unattach_min', 'close_unattach_max', 'close_left_up'], default="close_min")
+    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'knn', 'transformer_choose',
+                                                                 'close_unattach_min', 'close_unattach_max', 
+                                                                 'close_left_up', 'close_center', 'ex_corner'], default="close_min")
+    parser.add_argument("--freqs_cis_reorder_shceme", type=str, choices=['output_reorder', 'input_reorder', 'None'], default='None')
+    parser.add_argument("--interlacing_type", type=str, choices=['adam', 'spin_adam', 'corner_adam'], default="adam", help="interlacing type, options: adam, spin_adam")
+    parser.add_argument("--target_aware_emb", action='store_true')
+    parser.add_argument("--is_adaLN", action='store_true', default=False)
 
     args = parser.parse_args()
     main(args)

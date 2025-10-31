@@ -72,6 +72,7 @@ class ModelArgs:
     freqs_cis_reorder_shceme: str = None # how to reorder the freqs_cis for position embedding
     interlacing_type: str = "adam"  # interlacing type, options: adam, spin_adam
     target_aware_emb: bool = False  # whether to use target-aware embedding
+    is_adaLN: bool = False  # whether to use adaLN-Zero in reorder blocks
 
 
 #################################################################################
@@ -276,6 +277,62 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.wo(output))
         return output
 
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    Modulates the input tensor x using shift and scale tensors for adaptive normalization.
+    """
+    # x: (B, L, C), shift/scale: (B, C)
+    # Unsqueeze (1) inserts sequence dimension
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+class ConditionedEnhancementBlock(nn.Module):
+    """
+    一个用于 Pass 间特征增强的 Block，使用 AdaLN 机制注入条件信息 c。
+    该 Block 假定其输入 x 是需要被优化的 Pass 特征 (如 h_curr_pass)。
+    """
+    def __init__(self, config: ModelArgs, drop_path: float):
+        super().__init__()
+        self.attention = Attention(config)
+        self.feed_forward = FeedForward(config)
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) 
+        self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps) 
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), 
+            nn.Linear(config.dim, 6 * config.dim, bias=True)
+        )
+
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor, 
+        freqs_cis: torch.Tensor, 
+        input_pos: Optional[torch.Tensor] = None, 
+        mask: Optional[torch.Tensor] = None
+    ):
+        # compute AdaLN modulation parameters from condition c
+        # c.shape: (B, 1, C)
+        c = c.squeeze(1)  # (B, C)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        # Modulated Attention Block
+        attn_input = modulate(self.attention_norm(x), shift_msa, scale_msa)
+        attn_output = self.attention(attn_input, freqs_cis, input_pos, mask)
+        
+        # apply Gate and residual connection
+        h = x + self.drop_path(gate_msa.unsqueeze(1) * attn_output)
+
+        # Modulated FeedForward Block
+        # apply AdaLN to FFN input
+        ffn_input = modulate(self.ffn_norm(h), shift_mlp, scale_mlp)
+        
+        # compute FFN
+        ffn_output = self.feed_forward(ffn_input)
+        
+        # apply Gate and residual connection
+        out = h + self.drop_path(gate_mlp.unsqueeze(1) * ffn_output)
+        
+        return out
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelArgs, drop_path: float):
@@ -314,6 +371,7 @@ class Transformer(nn.Module):
         self.freqs_cis_reorder_shceme = config.freqs_cis_reorder_shceme
         self.interlacing_type = config.interlacing_type
         self.target_aware_emb = config.target_aware_emb  # whether to use target-aware embedding
+        self.is_adaLN = config.is_adaLN
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -335,8 +393,44 @@ class Transformer(nn.Module):
                                                              pre_token_choose=self.pre_token_choose,
                                                              freqs_cis_reorder_shceme=self.freqs_cis_reorder_shceme,
                                                              interlacing_type=self.interlacing_type)
+        self.ori_masked_coords = self.auto_regr_struct.ori_masked_coords
+        self.first_pass_token_num = self.ori_masked_coords[0].shape[0]
+        # Precompute KNN plan
+        if self.pre_token_choose == 'knn':
+            self.knn_idx_names = []
+            self.knn_w_names = []
+            knn_idxs, knn_ws = self.precompute_knn_plan_all_passes(self.ori_masked_coords)
+            for i, (knn_idx, knn_w) in enumerate(zip(knn_idxs, knn_ws)):
+                self.register_buffer(f'knn_idx_pass{i}', knn_idx)
+                self.register_buffer(f'knn_w_pass{i}', knn_w)
+                self.knn_idx_names.append(f'knn_idx_pass{i}')
+                self.knn_w_names.append(f'knn_w_pass{i}')
+
         self.learnable_pos_embedding = nn.Parameter(torch.randn(config.dim))
+
+        # 2-layer MLP with GELU
+        if self.target_aware_emb:
+            # set intermediate dimension: d_model * 4 or d_model * 2
+            d_mid = config.dim * 4 
+            
+            self.pos_emb_mlp = nn.Sequential(
+                nn.Linear(config.dim, d_mid),
+                nn.GELU(),
+                nn.Linear(d_mid, config.dim)
+            )
+            self._init_mlp_weights()
         
+        # transformer blocks for input token sequence reordering
+        if self.pre_token_choose == 'transformer_choose':
+            self.layers_inputreorder = torch.nn.ModuleList()
+            for pass_i, _ in enumerate(self.ori_masked_coords):
+                if pass_i == 0:
+                    continue
+                if self.is_adaLN:
+                    self.layers_inputreorder.append(ConditionedEnhancementBlock(config, drop_path=0.0))
+                else:
+                    self.layers_inputreorder.append(TransformerBlock(config, drop_path=0.0))
+
         # transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
@@ -352,8 +446,10 @@ class Transformer(nn.Module):
         assert grid_size * grid_size == self.block_size
         self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
         # Sinusoidal pos embedding for next-token prediction
-        self.SinusoidalPosEmb = precompute_SinusoidalPosEmb(grid_size=grid_size, dim=self.config.dim, cls_token_num=self.cls_token_num)
-        self.assemble_SinusoidalPosEmb = self.auto_regr_struct.assemble_sinusoidal_positional_embedding(self.SinusoidalPosEmb)
+        SinusoidalPosEmb_2d = get_2d_sincos_pos_embed(embed_dim=self.config.dim, grid_size=grid_size, cls_token_num=self.cls_token_num)
+        SinusoidalPosEmb_2d = torch.tensor(SinusoidalPosEmb_2d)
+        assemble_SinusoidalPosEmb_2d = self.auto_regr_struct.assemble_sinusoidal_positional_embedding(SinusoidalPosEmb_2d)
+        self.register_buffer('assemble_SinusoidalPosEmb_2d', assemble_SinusoidalPosEmb_2d)
 
         # KVCache
         self.max_batch_size = -1
@@ -368,6 +464,29 @@ class Transformer(nn.Module):
         # Zero-out output layers:
         nn.init.constant_(self.output.weight, 0)
 
+        if self.is_adaLN:
+            blocks_to_check = self.layers_inputreorder 
+            for block in blocks_to_check:
+                if isinstance(block, ConditionedEnhancementBlock):
+                    # 找到 adaLN_modulation 中的最后一个 nn.Linear
+                    # 它应该是 nn.Sequential 中的第二个元素
+                    final_linear = block.adaLN_modulation[1] 
+                    
+                    # 将权重和偏置置为零
+                    nn.init.constant_(final_linear.weight, 0)
+                    nn.init.constant_(final_linear.bias, 0)
+
+    def _init_mlp_weights(self):
+        """
+        initialize the 2nd layer of MLP to 0
+        so that at the beginning, the target-aware positional embedding contribution is zero
+        """
+        if hasattr(self, 'pos_emb_mlp'):
+            nn.init.constant_(self.pos_emb_mlp[2].weight, 0)
+            nn.init.constant_(self.pos_emb_mlp[2].bias, 0)
+        else:
+            raise ValueError("The model does not have pos_emb_mlp attribute")
+
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -377,6 +496,84 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
 
+    @torch.no_grad()
+    def precompute_knn_plan_all_passes(self, decoded_masked_coords: list[torch.Tensor]):
+        all_knn_idxs = []
+        all_knn_ws = []
+        for pass_i, query_xy in enumerate(decoded_masked_coords):
+            if pass_i == 0:
+                continue
+            known_xy = torch.cat(decoded_masked_coords[:pass_i], dim=0)
+            idx, w = self.precompute_knn_plan_one_passes(known_xy.to(dtype=torch.float32), query_xy.to(dtype=torch.float32), k=3, weight="idw", p=2.0, eps=1e-8, chunk_q=65536)
+            all_knn_idxs.append(idx)
+            all_knn_ws.append(w)
+        
+        return all_knn_idxs, all_knn_ws
+    
+    @torch.no_grad()
+    def precompute_knn_plan_one_passes(self, known_xy: torch.Tensor,  # (N,2) float32 [x,y]
+                                            query_xy: torch.Tensor,  # (M,2) float32 [x,y]
+                                            *, k: int = 3,
+                                            weight: str = "idw",
+                                            p: float = 2.0, sigma: float = 3.0, eps: float = 1e-8,
+                                            chunk_q: Optional[int] = None
+                                        ):
+        
+        N = known_xy.size(0); k = min(k, N); assert k > 0 and N > 0
+        if chunk_q is None:
+            d = torch.cdist(query_xy, known_xy)                # (M,N)
+            d_k, idx = torch.topk(d, k=k, dim=-1, largest=False)  # (M,k)
+        else:
+            M = query_xy.size(0); dks, idxs = [], []
+            for s in range(0, M, chunk_q):
+                e = min(s + chunk_q, M)
+                dk, ix = torch.topk(torch.cdist(query_xy[s:e], known_xy), k=k, dim=-1, largest=False)
+                dks.append(dk); idxs.append(ix)
+            d_k, idx = torch.cat(dks, 0), torch.cat(idxs, 0)
+
+        if weight in ("idw", "shepard"):
+            near0 = (d_k <= eps)
+            if near0.any():
+                z = near0.sum(-1, keepdim=True).clamp_min(1.0)
+                w = torch.where(near0, 1.0 / z, torch.zeros_like(d_k))
+                mask = (near0.sum(-1) == 0)
+                if mask.any():
+                    di = d_k[mask]; wi = (di + eps).pow(-p); wi /= (wi.sum(-1, True) + eps); w[mask] = wi
+            else:
+                w = (d_k + eps).pow(-p); w /= (w.sum(-1, True) + eps)
+        elif weight == "rbf":
+            w = torch.exp(-(d_k ** 2) / (2.0 * (sigma ** 2) + 1e-12)); w /= (w.sum(-1, True) + eps)
+        else:
+            raise ValueError(f"Unknown weight '{weight}'")
+        return idx, w
+
+    @torch.no_grad()
+    def apply_knn_plan(self,
+        idx: torch.Tensor,    # (M,k)
+        w:   torch.Tensor,    # (M,k)
+        known_f: torch.Tensor # (B,N,C)
+    ) -> torch.Tensor:
+        # B, N, C = known_f.shape
+        # M, k = idx.shape
+        # ix = idx.view(1, M, k, 1).expand(B, M, k, C)     # (B,M,k,C)
+        # nnf = torch.gather(known_f, dim=1, index=ix)     # (B,M,k,C)
+        # return (nnf * w.view(1, M, k, 1)).sum(dim=2)     # (B,M,C)
+        B, N, C = known_f.shape; M, k = idx.shape
+    
+        idx_flat = idx.view(-1).unsqueeze(0).expand(B, M * k) # (B, M*k)
+        
+        # 扩展 C 维度：将 (B, M*k) 索引复制 C 次，以便在 C 维度上进行 gather
+        # 这样索引张量 (B, M*k, C) 就与 known_f (B, N, C) 有相同的维度数 3
+        idx_b_mk_c = idx_flat.unsqueeze(-1).repeat(1, 1, C).long() # (B, M*k, C)
+        
+        # nnf_temp.shape: (B, M*k, C)
+        nnf_temp = torch.gather(known_f, dim=1, index=idx_b_mk_c) 
+        
+        nnf = nnf_temp.view(B, M, k, C) # (B, M, k, C)
+        
+        w_4d = w.view(1, M, k, 1) # (1, M, k, 1)
+        return (nnf * w_4d).sum(dim=2) # (B, M, C)
+    
     def setup_caches(self, max_batch_size, max_seq_length, dtype):
         # if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
         #     return
@@ -392,8 +589,9 @@ class Transformer(nn.Module):
         grid_size = self.auto_regr_struct.training_attention_mask.shape[0]
         grid_size = int(grid_size)
         causal_mask[:grid_size, :grid_size] = self.auto_regr_struct.training_attention_mask
-        self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-
+        causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
+        self.register_buffer('causal_mask', causal_mask)
+        
     def forward(
         self, 
         idx: torch.Tensor, 
@@ -408,7 +606,8 @@ class Transformer(nn.Module):
             raise ValueError("idx and cond_idx cannot be both None")
 
     def forward_inference(self, 
-                          x: torch.Tensor, 
+                          x: torch.Tensor,
+                          cond_embeddings: torch.Tensor,
                           freqs_cis: torch.Tensor, 
                           input_pos: torch.Tensor,
                           pass_i: int = None):
@@ -422,11 +621,38 @@ class Transformer(nn.Module):
 
         
         assert self.auto_regr_struct.training_attention_mask is not None
-        mask = self.causal_mask[:x.shape[0], None, input_pos].to(x.device)
+        mask = self.causal_mask[:x.shape[0], None, input_pos]
 
         h = x
         if self.target_aware_emb:
-            h = h + self.assemble_SinusoidalPosEmb[input_pos].unsqueeze(0).to(h.device)
+            pos_emb = self.assemble_SinusoidalPosEmb_2d
+            delta_h = self.pos_emb_mlp(pos_emb) 
+            h = h + delta_h[input_pos].unsqueeze(0)
+
+        if pass_i >= self.first_pass_token_num: # the first pass is generated token-by-token, so it does not need input reordering
+            if self.pre_token_choose == 'knn' and h.shape[1] > 1:
+                idx_name = self.knn_idx_names[int(pass_i - self.first_pass_token_num)]
+                w_name = self.knn_w_names[int(pass_i - self.first_pass_token_num)]
+                knn_idx = getattr(self, idx_name) # 这将返回 CUDA Tensor
+                knn_w = getattr(self, w_name)
+                token_num_curr_pass = knn_idx.shape[0]
+                known_f = h  # (B,N,C)
+                pred_feat = self.apply_knn_plan(knn_idx, knn_w, known_f)  # (B,M,C) in our case, M=N
+                h = pred_feat
+            elif self.pre_token_choose == 'transformer_choose' and h.shape[1] > 1:
+                token_num_curr_pass = self.ori_masked_coords[pass_i-self.first_pass_token_num+1].shape[0]
+                h_curr_pass = h  # (B, curr_pass_token_num, C)
+                if self.is_adaLN:
+                    h = self.layers_inputreorder[pass_i-self.first_pass_token_num](h_curr_pass, cond_embeddings,
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
+                                    None, 
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+                else:
+                    h = self.layers_inputreorder[pass_i-self.first_pass_token_num](h_curr_pass, 
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
+                                    None, 
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+
         for layer in self.layers:
             h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
         h = self.norm(h)
@@ -448,8 +674,52 @@ class Transformer(nn.Module):
 
         h = self.tok_dropout(assem_input_embeddings)
         if self.target_aware_emb:
-            h = h + self.assemble_SinusoidalPosEmb.unsqueeze(0).to(h.device)
+            self.assemble_SinusoidalPosEmb_2d = self.assemble_SinusoidalPosEmb_2d.to(dtype=h.dtype)
+            pos_emb = self.assemble_SinusoidalPosEmb_2d
+            delta_h = self.pos_emb_mlp(pos_emb) 
+            h = h + delta_h.unsqueeze(0)
         
+        if self.pre_token_choose == 'knn':
+            for i, (idx_name, w_name) in enumerate(zip(self.knn_idx_names, self.knn_w_names)): 
+                knn_idx = getattr(self, idx_name) # 这将返回 CUDA Tensor
+                knn_w = getattr(self, w_name)
+                token_num_curr_pass = knn_idx.shape[0]
+                h_left = h[:, :token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                known_f = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
+                pred_feat = self.apply_knn_plan(knn_idx, knn_w, known_f)  # (B,M,C) in our case, M=N
+                h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
+                h = h_new
+        
+        elif self.pre_token_choose == 'transformer_choose' and not self.is_adaLN:
+            # self.logger.info(f"Using normal TransformerBlock in input reordering blocks during training.")
+            h_before_reorder = h.clone()
+            for pass_i, layer in enumerate(self.layers_inputreorder):
+                token_num_curr_pass = self.ori_masked_coords[pass_i+1].shape[0]
+                h_left = h[:, :token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                h_curr_pass = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
+                h_reordered = layer(h_curr_pass, 
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
+                                    input_pos, 
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+                h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
+                h = h_new
+        
+        elif self.pre_token_choose == 'transformer_choose' and self.is_adaLN:
+            h_before_reorder = h.clone()
+            for pass_i, layer in enumerate(self.layers_inputreorder):
+                token_num_curr_pass = self.ori_masked_coords[pass_i+1].shape[0]
+                h_left = h[:, :token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                h_curr_pass = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
+                h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
+                h_reordered = layer(h_curr_pass, cond_embeddings,
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
+                                    input_pos, 
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+                h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
+                h = h_new
+
         assert self.auto_regr_struct.training_attention_mask is not None
 
 
@@ -501,7 +771,7 @@ class Transformer(nn.Module):
         cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
         x = torch.empty([bs, 0, self.config.dim], device=cond_idx.device, dtype=cond_combined_tokens.dtype)
         if self.target_aware_emb:
-            self.assemble_SinusoidalPosEmb = self.assemble_SinusoidalPosEmb.to(device=cond_idx.device, dtype=cond_combined_tokens.dtype)
+            self.assemble_SinusoidalPosEmb_2d = self.assemble_SinusoidalPosEmb_2d.to(dtype=cond_combined_tokens.dtype)
         input_pos = torch.empty(0, device=cond_idx.device, dtype=torch.long)
             
         # TODO: add support for KV cache (below code is from RandAR)
@@ -551,7 +821,7 @@ class Transformer(nn.Module):
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
             with sdpa_kernel(SDPBackend.MATH):
-                logits = self.forward_inference(next_embeddings, freqs_cis, input_pos, pass_i=decoding_step)
+                logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step)
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
@@ -634,6 +904,56 @@ def precompute_SinusoidalPosEmb(grid_size: int, dim: int, cls_token_num=120):
     final_pe = torch.cat([cls_pe, pe], dim=0) # shape of final_pe: [seq_len + cls_token_num, dim]
 
     return final_pe
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token_num=None):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token_num is not None:
+        pos_embed = np.concatenate([np.zeros([cls_token_num, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)

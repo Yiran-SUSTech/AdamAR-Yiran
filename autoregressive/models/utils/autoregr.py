@@ -21,6 +21,7 @@ class AutoRegressiveStructure:
                  image_width: int,
                  image_height: int,
                  token_map: TokenMap,
+                 ori_masked_coords: list[torch.Tensor],
                  decoded_masked_coords: list[torch.Tensor],
                  freqs_cis_reorder_shceme: str = None,
                  ):
@@ -30,6 +31,7 @@ class AutoRegressiveStructure:
         self.token_map_tensors = TokenMapTensors(token_map, image_width, image_height)   
         self._cond_len = self.token_map.cond_len
         self.decoded_masked_coords = copy.deepcopy(decoded_masked_coords)
+        self.ori_masked_coords = copy.deepcopy(ori_masked_coords)
         
         self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords) # decoding_schedule其实是output token的index的list，也就是从0到total_len-1
         self.training_attention_mask = self.get_training_attention_mask(self.decoding_schedule)

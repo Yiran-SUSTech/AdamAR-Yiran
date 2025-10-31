@@ -100,7 +100,7 @@ def get_quadrants(col:int, row:int, image_width: int, image_height: int) -> int:
     else:
         return 3  # Bottom-right
 
-def generalized_adam_interlacing(width: int, height: int, base_block_size: int, interlacing_type: str = "adam"):
+def generalized_adam_interlacing(logger, width: int, height: int, base_block_size: int, interlacing_type: str = "adam"):
     assert width >= base_block_size
     assert height >= base_block_size
     assert width % base_block_size == 0 and height % base_block_size == 0, (
@@ -120,7 +120,8 @@ def generalized_adam_interlacing(width: int, height: int, base_block_size: int, 
                 if not filled[y, x]:
                     mask[y, x] = True
                     filled[y, x] = True
-                    if interlacing_type == "adam" or "corner_adam":
+                    if interlacing_type == "adam" or interlacing_type == "corner_adam":
+                        logger.info(f"using adam or corner_adam")
                         coords.append((x, y))
                     elif interlacing_type == "spin_adam":
                         quadrant = get_quadrants(x, y, width, height)
@@ -152,6 +153,8 @@ def convert_coner_adam_interlacing(width: int, height: int, adam_coords: list[to
 
     new_adam_coords: list[torch.Tensor] = []
     converted_coords = []
+
+    pre_token_seq = []
     for first_pass_coord in first_pass_coords.tolist():
         x, y = first_pass_coord
         filled[y,x] = True
@@ -185,12 +188,13 @@ def convert_coner_adam_interlacing(width: int, height: int, adam_coords: list[to
             filled[ynew, xnew] = True
             tmp_coords.append((xnew, ynew))
             converted_coords.append((xnew, ynew))
+            pre_token_seq.append((x,y))
         new_adam_coords.append(torch.tensor(tmp_coords, dtype=torch.int))
         pass_idx += 1
         if dist.get_rank() == 0:
             print(f"pass_coords: ({tmp_coords})")
 
-    return new_adam_coords
+    return new_adam_coords, pre_token_seq
 
 
 
@@ -245,10 +249,10 @@ def get_autoregressive_structure(
     freqs_cis_reorder_shceme: str = None,
     interlacing_type: str = "adam",
 ) -> AutoRegressiveStructure:
-    _, masked_coords, _ = generalized_adam_interlacing(width, height, base_block_size, interlacing_type)
+    _, masked_coords, _ = generalized_adam_interlacing(logger, width, height, base_block_size, interlacing_type)
 
     if interlacing_type == "corner_adam":
-        masked_coords = convert_coner_adam_interlacing(width, height, masked_coords)
+        masked_coords, pre_token_seq = convert_coner_adam_interlacing(width, height, masked_coords)
     total_len = width * height + cond_len
 
     #########################################
@@ -315,20 +319,29 @@ def get_autoregressive_structure(
 
 
     # passes with learnable tokens
+    visited_coords_idx = 0
     for i_pass in range(1, len(masked_coords)):
         curr_coords = masked_coords[i_pass].tolist()
 
         generated_tokens = list(t for t in token_map.output_tokens() if t.token_type() == TokenType.IMAGE)
-        for curr_coord in curr_coords:
+        for idxx, curr_coord in enumerate(curr_coords):
             x, y = curr_coord
             curr_img_token = ImageToken(x_coord=x, y_coord=y)
 
-            closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
-                token_map, curr_img_token, generated_tokens, width
-            )
+            if pre_token_choose == 'ex_corner':
+                closest_token = ImageToken(
+                    x_coord=pre_token_seq[visited_coords_idx][0], y_coord=pre_token_seq[visited_coords_idx][1]
+                    )
+            elif pre_token_choose == 'knn' or 'transformer_choose':
+                closest_token = generated_tokens[idxx]
+            else:
+                closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
+                    token_map, curr_img_token, generated_tokens, width
+                )
             if dist.get_rank() == 0:
                 print(f"closest previous token: ({closest_token.x_coord}, {closest_token.y_coord}), Current token: ({curr_img_token.x_coord}, {curr_img_token.y_coord})")
             token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
+            visited_coords_idx += 1
 
     decoded_masked_coords = autoregressive_first_step(masked_coords)
     # print("decoded_masked_coords:", decoded_masked_coords) ##############################################
@@ -338,6 +351,7 @@ def get_autoregressive_structure(
         image_height=height,
         image_width=width,
         token_map=token_map,
+        ori_masked_coords=masked_coords,
         decoded_masked_coords=decoded_masked_coords,
         freqs_cis_reorder_shceme=freqs_cis_reorder_shceme,
     )

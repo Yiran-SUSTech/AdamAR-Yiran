@@ -19,6 +19,7 @@ import time
 import inspect
 import argparse
 import math
+from ptflops import get_model_complexity_info
 
 import wandb
 import numpy as np
@@ -98,6 +99,54 @@ def log_image(args, latent_size, vq_model, gpt_model, logger, device, epoch, ran
 def cleanup():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+def print_model_summary(model, logger, seq_len):
+    """
+    打印模型每一层的名称和参数量。
+    """
+    total_params = 0
+    trainable_params = 0
+    
+    # 打印标题
+    logger.info("=" * 60)
+    logger.info("Model Parameter Summary:")
+    logger.info("{:<50} {:>10} {:>10} {:>20}".format("Layer Name", "Params (K)", "Trainable", "Dtype"))
+    logger.info("-" * 60)
+
+    # 使用 named_parameters() 遍历所有参数
+    for name, parameter in model.named_parameters():
+        # 获取当前参数的元素数量
+        param_count = parameter.numel()
+        total_params += param_count
+        
+        # 检查参数是否可训练
+        is_trainable = parameter.requires_grad
+        if is_trainable:
+            trainable_params += param_count
+        
+        # 打印当前层的信息
+        logger.info("{:<50} {:>10.2f} {:>10} {:>20}".format(
+            name,
+            param_count / 1e3, # 转换为千 (K)
+            "Yes" if is_trainable else "No",
+            str(parameter.dtype)
+        ))
+
+    # 打印总结
+    logger.info("-" * 60)
+    logger.info("Total Model Parameters: {:.2f} M".format(total_params / 1e6))
+    logger.info("Total Trainable Parameters: {:.2f} M".format(trainable_params / 1e6))
+    logger.info("=" * 60)
+    flops, params = get_model_complexity_info(
+        model,
+        (1, seq_len), # 输入的尺寸，不包含 batch size
+        as_strings=True,
+        print_per_layer_stat=False,
+        verbose=True
+    )
+
+    logger.info(f"Model FLOPs: {flops}") # 结果通常会以 GFlops 的形式显示
+    logger.info(f"Model Params: {params}")
 
 #################################################################################
 #                                  Training Loop                                #
@@ -179,6 +228,9 @@ def main(args):
     steps_per_epoch = len(loader) # the number of batches loaded into the rank, also the number of steps per epoch
     total_training_steps = steps_per_epoch * args.epochs
     warmup_steps = int(total_training_steps * args.warmup_percent)
+    constant_steps = int(total_training_steps * args.const_percent)
+    cosine_start_step = warmup_steps + constant_steps
+    cosine_total_steps = total_training_steps - cosine_start_step
     logger.info(f"Dataset contains {len(dataset):,} images ({args.code_path}) "
                 f"{flip_info} flip augmentation and {aug_info} crop augmentation")
     
@@ -215,6 +267,7 @@ def main(args):
         freqs_cis_reorder_shceme=args.freqs_cis_reorder_shceme,
         interlacing_type=args.interlacing_type,
         target_aware_emb=args.target_aware_emb,
+        is_adaLN=args.is_adaLN,
     ).to(device)
 
     # visualize passes and attention mask
@@ -254,6 +307,20 @@ def main(args):
             decoded_masked_coords=model.auto_regr_struct.decoded_masked_coords,
             experiment_dir=experiment_dir
         )
+    
+    # --- 获取原始模型实例 ---
+    if hasattr(model, 'module'):
+        # model is DDP wrapped
+        raw_model = model.module
+    else:
+        raw_model = model
+
+    if hasattr(raw_model, '_orig_mod'):
+        # model is torch.compile wrapped
+        raw_model = raw_model._orig_mod
+
+    # --- 打印模型参数总结 ---
+    print_model_summary(raw_model, logger, latent_size ** 2)
 
 
     if args.is_wandb_log:
@@ -508,13 +575,16 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=0,help="top-k value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
     parser.add_argument("--cfg-scale",  type=float, default=1.0)
-    parser.add_argument("--is-lr-scheduler", action='store_true')
+    parser.add_argument("--is-lr-scheduler", action='store_true', default=False)
     parser.add_argument("--subpass-len", type=int, default=None, help="the length of each subpass, None means no subpass")
     parser.add_argument("--subpass-num", type=int, default=None, help="the number of subpasses within each pass, None means no subpass")
-    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'close_unattach_min', 'close_unattach_max', 'close_left_up', 'close_center'], default="close_min")
+    parser.add_argument("--pre_token_choose", type=str, choices=['close_min', 'close_max', 'knn', 'transformer_choose',
+                                                                 'close_unattach_min', 'close_unattach_max', 
+                                                                 'close_left_up', 'close_center', 'ex_corner'], default="close_min")
     parser.add_argument("--freqs_cis_reorder_shceme", type=str, choices=['output_reorder', 'input_reorder', 'None'], default='None')
     parser.add_argument("--interlacing_type", type=str, choices=['adam', 'spin_adam', 'corner_adam'], default="adam", help="interlacing type, options: adam, spin_adam")
-    parser.add_argument("--target_aware_emb", action='store_true')
+    parser.add_argument("--target_aware_emb", action='store_true', default=False)
+    parser.add_argument("--is_adaLN", action='store_true', default=False)
 
     args = parser.parse_args()
     main(args)
