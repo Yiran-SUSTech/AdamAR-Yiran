@@ -332,7 +332,7 @@ def get_autoregressive_structure(
                 closest_token = ImageToken(
                     x_coord=pre_token_seq[visited_coords_idx][0], y_coord=pre_token_seq[visited_coords_idx][1]
                     )
-            elif pre_token_choose == 'knn' or 'transformer_choose':
+            elif pre_token_choose == 'knn' or pre_token_choose == 'transformer_choose':
                 closest_token = generated_tokens[idxx]
             else:
                 closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
