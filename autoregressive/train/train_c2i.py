@@ -132,20 +132,26 @@ def print_model_summary(model, logger, seq_len):
             str(parameter.dtype)
         ))
 
+    L_idx = seq_len 
+    # 按照 forward_train(self, idx, cond_idx, input_pos, targets, valid) 的顺序
+    idx_dummy = torch.ones((1, L_idx), dtype=torch.long, device=device) 
+    cond_idx_dummy = torch.ones((1,), dtype=torch.long, device=device)
+
+    inputs = (idx_dummy, cond_idx_dummy) 
+
+    # --- 2. 计算 MACs 和参数 ---
+    macs, params = profile(model, inputs=inputs)
+
+    # 改善输出格式
+    macs, params = clever_format([macs, params], "%.3f")
+
     # 打印总结
     logger.info("-" * 60)
     logger.info("Total Model Parameters: {:.2f} M".format(total_params / 1e6))
     logger.info("Total Trainable Parameters: {:.2f} M".format(trainable_params / 1e6))
     logger.info("=" * 60)
-    flops, params = get_model_complexity_info(
-        model,
-        (1, seq_len), # 输入的尺寸，不包含 batch size
-        as_strings=True,
-        print_per_layer_stat=False,
-        verbose=True
-    )
 
-    logger.info(f"Model FLOPs: {flops}") # 结果通常会以 GFlops 的形式显示
+    logger.info(f"Model FLOPs: {macs}") # 结果以 GFlops 的形式显示
     logger.info(f"Model Params: {params}")
 
 #################################################################################
@@ -227,21 +233,66 @@ def main(args):
     # bs_per_rank = int(total_data_num // args.global_batch_size)
     steps_per_epoch = len(loader) # the number of batches loaded into the rank, also the number of steps per epoch
     total_training_steps = steps_per_epoch * args.epochs
+
+    # Set default values for learning rate parameters
+    if args.max_lr is None:
+        args.max_lr = args.lr
+    if args.min_lr is None:
+        args.min_lr = args.lr * 0.1
+    if args.cosine_percent is None:
+        args.cosine_percent = 1.0 - args.warmup_percent - args.const_percent
+
+    # Validate that percentages sum to 1.0
+    total_percent = args.warmup_percent + args.const_percent + args.cosine_percent
+    if abs(total_percent - 1.0) > 1e-6:
+        logger.warning(f"Warning: warmup_percent ({args.warmup_percent}) + const_percent ({args.const_percent}) + cosine_percent ({args.cosine_percent}) = {total_percent}, which does not equal 1.0")
+
     warmup_steps = int(total_training_steps * args.warmup_percent)
     constant_steps = int(total_training_steps * args.const_percent)
+    cosine_steps = int(total_training_steps * args.cosine_percent)
     cosine_start_step = warmup_steps + constant_steps
-    cosine_total_steps = total_training_steps - cosine_start_step
+
     logger.info(f"Dataset contains {len(dataset):,} images ({args.code_path}) "
                 f"{flip_info} flip augmentation and {aug_info} crop augmentation")
+    logger.info(f"Learning rate schedule: max_lr={args.max_lr}, min_lr={args.min_lr}")
+    logger.info(f"warmup steps: {warmup_steps} ({args.warmup_percent*100:.1f}%), constant steps: {constant_steps} ({args.const_percent*100:.1f}%), cosine steps: {cosine_steps} ({args.cosine_percent*100:.1f}%), total training steps: {total_training_steps}")
     
     def lr_lambda(current_step: int):
+        """
+        Warmup -> Constant -> Cosine Annealing 调度策略。
+        返回学习率相对于 optimizer 初始 lr 的乘数。
+
+        - Warmup 阶段: 从 0 线性增长到 max_lr
+        - Constant 阶段: 保持 max_lr
+        - Cosine Annealing 阶段: 从 max_lr 按余弦曲线下降到 min_lr
+        """
         if current_step < warmup_steps:
-            # linear warm-up stage
-            return float(current_step) / float(max(1, warmup_steps))
+            # Warmup: 从 0 线性增长到 max_lr
+            # 返回值范围: [0, max_lr/lr]
+            return (args.max_lr / args.lr) * (float(current_step) / float(max(1, warmup_steps)))
+
+        elif current_step < cosine_start_step:
+            # Constant: 保持 max_lr
+            return args.max_lr / args.lr
+
+        elif current_step < total_training_steps:
+            # Cosine Annealing: 从 max_lr 下降到 min_lr
+            if cosine_steps <= 0:
+                return args.min_lr / args.lr
+
+            progress = float(current_step - cosine_start_step) / float(cosine_steps)
+            progress = min(1.0, progress)
+
+            # Cosine annealing formula: 从 1.0 下降到 0.0
+            cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            # 将 cosine_factor 映射到 [min_lr, max_lr] 范围
+            current_lr = args.min_lr + (args.max_lr - args.min_lr) * cosine_factor
+
+            return current_lr / args.lr
         else:
-            # cosine annealing stage
-            progress = float(current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            # 超出训练步数，返回最小学习率
+            return args.min_lr / args.lr
 
     # Setup model
     if args.drop_path_rate > 0.0:
@@ -268,6 +319,9 @@ def main(args):
         interlacing_type=args.interlacing_type,
         target_aware_emb=args.target_aware_emb,
         is_adaLN=args.is_adaLN,
+        num_inputreorder_modules=args.num_inputreorder_modules,
+        use_pass_aware_adaLN=args.use_pass_aware_adaLN,
+        use_class_aware_adaLN=args.use_class_aware_adaLN,
     ).to(device)
 
     # visualize passes and attention mask
@@ -320,7 +374,7 @@ def main(args):
         raw_model = raw_model._orig_mod
 
     # --- 打印模型参数总结 ---
-    print_model_summary(raw_model, logger, latent_size ** 2)
+    print_model_summary(model, logger, latent_size ** 2, args.cls_token_num, device)
 
 
     if args.is_wandb_log:
@@ -559,18 +613,22 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10) # log every log_every steps
     parser.add_argument("--ckpt-every", type=int, default=5000) # save checkpoint every ckpt_every epochs
-    parser.add_argument("--is-wandb-log", action='store_true')
-    parser.add_argument("--wandb_offline", action='store_true')
+    parser.add_argument("--is-wandb-log", action='store_true', default=False)
+    parser.add_argument("--wandb_offline", action='store_true', default=False)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--num-datapoints", type=int, default=None, help="number of data points to train on")
     parser.add_argument("--num-data", type=int, default=None, help="number of data points to train on") # sample only first num_data files
-    parser.add_argument("--from_llamagen", action='store_true')
+    parser.add_argument("--from_llamagen", action='store_true', default=False)
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--profiler_port", type=int, default=9012, help="the port of investigation") 
     parser.add_argument("--profile", action='store_true', default=True)
     parser.add_argument("--num-workers", type=int, default=24)  #############################################################
-    parser.add_argument("--warmup_percent", type=float, default=0.1, help="the ratio of warm-up steps in total number of steps")
+    parser.add_argument("--warmup_percent", type=float, default=0.01, help="the ratio of warm-up steps in total number of steps")
+    parser.add_argument("--const_percent", type=float, default=0.7, help="the ratio of steps with constant lr in total number of steps")
+    parser.add_argument("--cosine_percent", type=float, default=None, help="the ratio of cosine annealing steps in total number of steps, if None, it will be calculated as 1.0 - warmup_percent - const_percent")
+    parser.add_argument("--max-lr", type=float, default=None, help="maximum learning rate to reach during warmup, if None, it will be set to lr")
+    parser.add_argument("--min-lr", type=float, default=None, help="minimum learning rate at the end of cosine annealing, if None, it will be set to 0.1 * lr")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")
     parser.add_argument("--top-k", type=int, default=0,help="top-k value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
@@ -585,6 +643,9 @@ if __name__ == "__main__":
     parser.add_argument("--interlacing_type", type=str, choices=['adam', 'spin_adam', 'corner_adam'], default="adam", help="interlacing type, options: adam, spin_adam")
     parser.add_argument("--target_aware_emb", action='store_true', default=False)
     parser.add_argument("--is_adaLN", action='store_true', default=False)
+    parser.add_argument("--num_inputreorder_modules", type=int, default=None, help="the number of input reorder modules for transformer_choose")
+    parser.add_argument("--use_pass_aware_adaLN", action='store_true', default=False)
+    parser.add_argument("--use_class_aware_adaLN", action='store_true', default=False)
 
     args = parser.parse_args()
     main(args)

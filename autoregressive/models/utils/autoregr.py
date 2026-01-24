@@ -121,9 +121,6 @@ class AutoRegressiveStructure:
         )
         
         out_image_indices = self.token_map_tensors.out_token_indices[out_image_mask] + cond_lenn
-        if dist.get_rank() == 0:
-            print(f"out_image_indices.shape: {out_image_indices.shape}") ##############################################
-            print(f"out_image_indices: {out_image_indices}") ##############################################
         new_SinusoidalPosEmb = SinusoidalPosEmb[out_image_indices]
         
         return new_SinusoidalPosEmb

@@ -121,7 +121,6 @@ def generalized_adam_interlacing(logger, width: int, height: int, base_block_siz
                     mask[y, x] = True
                     filled[y, x] = True
                     if interlacing_type == "adam" or interlacing_type == "corner_adam":
-                        logger.info(f"using adam or corner_adam")
                         coords.append((x, y))
                     elif interlacing_type == "spin_adam":
                         quadrant = get_quadrants(x, y, width, height)
@@ -216,9 +215,7 @@ def set_subpass_by_len(adam_coords: list[torch.Tensor], subpass_len: int=1) -> l
             continue
         # if subpass length is 0, then, it is serial generation within each pass
         assert len(adam_coord) % subpass_len == 0, "Each pass length must be divisible by subpass_len"
-        tmp = adam_coord.reshape(-1, subpass_len, 2)
-        tmp = tmp.transpose(0,1).reshape(-1, 2)
-        autoregressive_n_step = tmp.split(len(adam_coord) // subpass_len, dim=0)
+        autoregressive_n_step = adam_coord.split(subpass_len, dim=0)
         new_adam_coords += list(autoregressive_n_step)
     
     return new_adam_coords
@@ -338,8 +335,6 @@ def get_autoregressive_structure(
                 closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
                     token_map, curr_img_token, generated_tokens, width
                 )
-            if dist.get_rank() == 0:
-                print(f"closest previous token: ({closest_token.x_coord}, {closest_token.y_coord}), Current token: ({curr_img_token.x_coord}, {curr_img_token.y_coord})")
             token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
             visited_coords_idx += 1
 

@@ -73,6 +73,10 @@ class ModelArgs:
     interlacing_type: str = "adam"  # interlacing type, options: adam, spin_adam
     target_aware_emb: bool = False  # whether to use target-aware embedding
     is_adaLN: bool = False  # whether to use adaLN-Zero in reorder blocks
+    use_conditioned_blocks: bool = False  # whether to use ConditionedEnhancementBlock instead of TransformerBlock
+    num_inputreorder_modules: int = None  # number of modules in layers_inputreorder, must be a divisor of (len(ori_masked_coords)-1), None means use all passes
+    use_pass_aware_adaLN: bool = False  # whether to use pass-aware adaLN in ConditionedEnhancementBlock (add pass_idx as additional condition)
+    use_class_aware_adaLN: bool = False  # whether to use class-aware adaLN in ConditionedEnhancementBlock (add class label as additional condition)
 
 
 #################################################################################
@@ -105,6 +109,32 @@ class LabelEmbedder(nn.Module):
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels).unsqueeze(1)
+        return embeddings
+
+
+#################################################################################
+#                      Embedding Layers for Pass Index                          #
+#################################################################################
+class PassEmbedder(nn.Module):
+    """
+    Embeds pass index into vector representations for pass-aware conditioning.
+    """
+    def __init__(self, num_passes, hidden_size):
+        super().__init__()
+        self.embedding_table = nn.Embedding(num_passes, hidden_size)
+        self.num_passes = num_passes
+
+    def forward(self, pass_idx: torch.Tensor):
+        """
+        Args:
+            pass_idx: (B,) tensor of pass indices, or scalar tensor
+        Returns:
+            embeddings: (B, 1, C) tensor
+        """
+        # Handle scalar or 1D tensor
+        if pass_idx.dim() == 0:
+            pass_idx = pass_idx.unsqueeze(0)
+        embeddings = self.embedding_table(pass_idx).unsqueeze(1)  # (B, 1, C)
         return embeddings
 
 
@@ -280,10 +310,11 @@ class Attention(nn.Module):
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     Modulates the input tensor x using shift and scale tensors for adaptive normalization.
+    Supports both token-wise and sequence-wise conditioning.
     """
-    # x: (B, L, C), shift/scale: (B, C)
-    # Unsqueeze (1) inserts sequence dimension
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    # x: (B, L, C)
+    # shift/scale can be either (B, 1, C) or (B, L, C)
+    return x * (1 + scale) + shift
 
 class ConditionedEnhancementBlock(nn.Module):
     """
@@ -293,44 +324,46 @@ class ConditionedEnhancementBlock(nn.Module):
     def __init__(self, config: ModelArgs, drop_path: float):
         super().__init__()
         self.attention = Attention(config)
-        self.feed_forward = FeedForward(config)
-        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps) 
+        self.feed_forward = FeedForward(config) # 保留 FFN
+        self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps) 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
+        # AdaLN 调制层：用于生成 Attention 和 FFN 的 shift, scale, gate
+        # 需要 3 * hidden_size for Attention (shift, scale, gate)
+        #              3 * hidden_size for FFN (shift, scale, gate)
+        # 总共 6 * hidden_size
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), 
+            nn.SiLU(), # SiLU 激活函数
             nn.Linear(config.dim, 6 * config.dim, bias=True)
         )
 
     def forward(
-        self, x: torch.Tensor, c: torch.Tensor, 
-        freqs_cis: torch.Tensor, 
-        input_pos: Optional[torch.Tensor] = None, 
-        mask: Optional[torch.Tensor] = None
+        self, x: torch.Tensor, c: torch.Tensor, # c 是条件特征 (例如: 条件 token C 的聚合表示)
+        freqs_cis: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ):
-        # compute AdaLN modulation parameters from condition c
-        # c.shape: (B, 1, C)
-        c = c.squeeze(1)  # (B, C)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        # c can be either (B, 1, C) for sequence-wise or (B, L, C) for token-wise conditioning
+        # shift_msa, scale_msa, gate_msa: (B, 1, C) or (B, L, C)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         
-        # Modulated Attention Block
+        # 2. Modulated Attention Block
         attn_input = modulate(self.attention_norm(x), shift_msa, scale_msa)
-        attn_output = self.attention(attn_input, freqs_cis, input_pos, mask)
-        
-        # apply Gate and residual connection
-        h = x + self.drop_path(gate_msa.unsqueeze(1) * attn_output)
 
-        # Modulated FeedForward Block
-        # apply AdaLN to FFN input
+        attn_output = self.attention(attn_input, freqs_cis, input_pos, mask)
+
+        # Apply gate and residual connection
+        h = x + self.drop_path(gate_msa * attn_output)
+
+        # 3. Modulated FeedForward Block
         ffn_input = modulate(self.ffn_norm(h), shift_mlp, scale_mlp)
-        
-        # compute FFN
+        # compute ffn output
         ffn_output = self.feed_forward(ffn_input)
-        
-        # apply Gate and residual connection
-        out = h + self.drop_path(gate_mlp.unsqueeze(1) * ffn_output)
-        
+
+        # Apply gate and residual connection
+        out = h + self.drop_path(gate_mlp * ffn_output)
+
         return out
 
 
@@ -372,6 +405,10 @@ class Transformer(nn.Module):
         self.interlacing_type = config.interlacing_type
         self.target_aware_emb = config.target_aware_emb  # whether to use target-aware embedding
         self.is_adaLN = config.is_adaLN
+        self.use_conditioned_blocks = config.use_conditioned_blocks  # whether to use ConditionedEnhancementBlock
+        self.num_inputreorder_modules = config.num_inputreorder_modules  # number of modules in layers_inputreorder
+        self.use_class_aware_adaLN = config.use_class_aware_adaLN  # whether to use pass-aware adaLN
+        self.use_pass_aware_adaLN = config.use_pass_aware_adaLN  # whether to use pass-aware adaLN
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -386,6 +423,7 @@ class Transformer(nn.Module):
         width = int(config.block_size ** 0.5)
         height = width
         #####################################################################
+        self.logger.info(f"self.interlacing_type: {self.interlacing_type}")
         self.auto_regr_struct = get_autoregressive_structure(width=width, height=height, 
                                                              base_block_size=config.adam_block_size, 
                                                              cond_len=config.cls_token_num, 
@@ -395,6 +433,14 @@ class Transformer(nn.Module):
                                                              interlacing_type=self.interlacing_type)
         self.ori_masked_coords = self.auto_regr_struct.ori_masked_coords
         self.first_pass_token_num = self.ori_masked_coords[0].shape[0]
+
+        # Pass embedding for pass-aware adaLN
+        if self.use_pass_aware_adaLN:
+            # total_passes = len(self.ori_masked_coords)
+            total_passes = len(self.auto_regr_struct.decoded_masked_coords) # 7 levels - 10 passes
+            self.pass_embedding = PassEmbedder(num_passes=total_passes, hidden_size=config.dim)
+            self.logger.info(f"Created PassEmbedder for {total_passes} passes")
+
         # Precompute KNN plan
         if self.pre_token_choose == 'knn':
             self.knn_idx_names = []
@@ -423,9 +469,23 @@ class Transformer(nn.Module):
         # transformer blocks for input token sequence reordering
         if self.pre_token_choose == 'transformer_choose':
             self.layers_inputreorder = torch.nn.ModuleList()
-            for pass_i, _ in enumerate(self.ori_masked_coords):
-                if pass_i == 0:
-                    continue
+            total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
+
+            # Determine number of modules
+            self.logger.info(f"expected num_inputreorder_modules: {self.num_inputreorder_modules}, total_passes: {total_passes}")
+            if self.num_inputreorder_modules is None:
+                self.num_inputreorder_modules = total_passes
+            else:
+                # Validate that num_inputreorder_modules is a divisor of total_passes
+                assert total_passes % self.num_inputreorder_modules == 0, \
+                    f"num_inputreorder_modules ({self.num_inputreorder_modules}) must be a divisor of total_passes ({total_passes})"
+
+            # Calculate how many passes each module handles
+            self.passes_per_module = total_passes // self.num_inputreorder_modules
+            self.logger.info(f"Creating {self.num_inputreorder_modules} input reorder modules, each handling {self.passes_per_module} passes")
+
+            # Create the modules
+            for module_i in range(self.num_inputreorder_modules):
                 if self.is_adaLN:
                     self.layers_inputreorder.append(ConditionedEnhancementBlock(config, drop_path=0.0))
                 else:
@@ -435,7 +495,11 @@ class Transformer(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
         for layer_id in range(config.n_layer):
-            self.layers.append(TransformerBlock(config, dpr[layer_id]))
+            if self.use_conditioned_blocks:
+                # 主 transformer layers 可以选择是否使用 pass_aware_adaLN
+                self.layers.append(ConditionedEnhancementBlock(config, dpr[layer_id]))
+            else:
+                self.layers.append(TransformerBlock(config, dpr[layer_id]))
 
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
@@ -465,14 +529,30 @@ class Transformer(nn.Module):
         nn.init.constant_(self.output.weight, 0)
 
         if self.is_adaLN:
-            blocks_to_check = self.layers_inputreorder 
+            # 遍历所有 ConditionedEnhancementBlock 实例
+            blocks_to_check = self.layers_inputreorder
+            # 如果 self.layers 也是 ConditionedEnhancementBlock，需要加入 self.layers
             for block in blocks_to_check:
                 if isinstance(block, ConditionedEnhancementBlock):
                     # 找到 adaLN_modulation 中的最后一个 nn.Linear
                     # 它应该是 nn.Sequential 中的第二个元素
-                    final_linear = block.adaLN_modulation[1] 
-                    
-                    # 将权重和偏置置为零
+                    final_linear = block.adaLN_modulation[1]
+
+                    # DiT 核心初始化: 将权重和偏置置为零
+                    nn.init.constant_(final_linear.weight, 0)
+                    nn.init.constant_(final_linear.bias, 0)
+
+                    # 如果启用了 pass-aware adaLN，也初始化 adaLN_modulation_pass
+                    if self.use_pass_aware_adaLN and hasattr(block, 'adaLN_modulation_pass'):
+                        final_linear_pass = block.adaLN_modulation_pass[1]
+                        nn.init.constant_(final_linear_pass.weight, 0)
+                        nn.init.constant_(final_linear_pass.bias, 0)
+
+        if self.use_conditioned_blocks:
+            # 初始化主 transformer blocks 中的 ConditionedEnhancementBlock
+            for block in self.layers:
+                if isinstance(block, ConditionedEnhancementBlock):
+                    final_linear = block.adaLN_modulation[1]
                     nn.init.constant_(final_linear.weight, 0)
                     nn.init.constant_(final_linear.bias, 0)
 
@@ -560,17 +640,21 @@ class Transformer(nn.Module):
         # return (nnf * w.view(1, M, k, 1)).sum(dim=2)     # (B,M,C)
         B, N, C = known_f.shape; M, k = idx.shape
     
+        # 1. 展平索引，并扩展 Batch 维度 (B, M*k)
         idx_flat = idx.view(-1).unsqueeze(0).expand(B, M * k) # (B, M*k)
         
-        # 扩展 C 维度：将 (B, M*k) 索引复制 C 次，以便在 C 维度上进行 gather
+        # 2. 扩展 C 维度：将 (B, M*k) 索引复制 C 次，以便在 C 维度上进行 gather
         # 这样索引张量 (B, M*k, C) 就与 known_f (B, N, C) 有相同的维度数 3
         idx_b_mk_c = idx_flat.unsqueeze(-1).repeat(1, 1, C).long() # (B, M*k, C)
         
-        # nnf_temp.shape: (B, M*k, C)
+        # 3. 执行 gather (在 dim=1，即 N 维度上查找)
+        # nnf_temp 形状为 (B, M*k, C)
         nnf_temp = torch.gather(known_f, dim=1, index=idx_b_mk_c) 
         
+        # 4. 恢复 (B, M, k, C) 形状
         nnf = nnf_temp.view(B, M, k, C) # (B, M, k, C)
         
+        # 5. 执行加权求和
         w_4d = w.view(1, M, k, 1) # (1, M, k, 1)
         return (nnf * w_4d).sum(dim=2) # (B, M, C)
     
@@ -640,21 +724,63 @@ class Transformer(nn.Module):
                 pred_feat = self.apply_knn_plan(knn_idx, knn_w, known_f)  # (B,M,C) in our case, M=N
                 h = pred_feat
             elif self.pre_token_choose == 'transformer_choose' and h.shape[1] > 1:
-                token_num_curr_pass = self.ori_masked_coords[pass_i-self.first_pass_token_num+1].shape[0]
+                # Calculate which module to use (shared module for multiple passes)
+                pass_idx = pass_i - self.first_pass_token_num  # 0-indexed pass (excluding first pass)
+                module_idx = pass_idx // self.passes_per_module
+
+                # In inference, use the actual token count from h (current pass only)
+                # The module is shared, but each pass is processed separately during inference
+                token_num_curr_pass = h.shape[1]
+
                 h_curr_pass = h  # (B, curr_pass_token_num, C)
                 if self.is_adaLN:
-                    h = self.layers_inputreorder[pass_i-self.first_pass_token_num](h_curr_pass, cond_embeddings,
-                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
-                                    None, 
-                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+                    # Get pass embedding if enabled
+                    pass_emb = None
+                    if self.use_pass_aware_adaLN:
+                        batch_size = h.shape[0]
+                        pass_idx_tensor = torch.tensor([pass_i], device=h.device).expand(batch_size)
+                        pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
+                        
+
+                    h = self.layers_inputreorder[module_idx](h_curr_pass, cond_embeddings,
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device),
+                                    None,
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device),
+                                    pass_emb=pass_emb)
                 else:
-                    h = self.layers_inputreorder[pass_i-self.first_pass_token_num](h_curr_pass, 
-                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
-                                    None, 
+                    h = self.layers_inputreorder[module_idx](h_curr_pass,
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device),
+                                    None,
                                     mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
 
         for layer in self.layers:
-            h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
+            # h = layer(h, freqs_cis, start_pos=input_pos, mask=self.causal_mask)
+            if self.use_conditioned_blocks:
+                # prepare token-wise conditioning
+                batch_size, seq_len, hidden_dim = h.shape # seq_len is current pass token num
+
+                # Expand class embedding to (B, L, C)
+                cond_embeddings_expanded = cond_embeddings[:, :self.cls_token_num, :].expand(batch_size, seq_len, hidden_dim)
+
+                if self.use_pass_aware_adaLN:
+                    # For inference, all tokens in current batch belong to the same pass
+                    # pass_idx = pass_i - self.first_pass_token_num  # 0-indexed pass (excluding first pass)
+                    pass_idx_tensor = torch.tensor([pass_i], device=h.device).expand(batch_size)
+                    pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
+                    pass_emb_expanded = pass_emb.expand(batch_size, seq_len, hidden_dim)  # (B, L, C)
+                    self.logger.info(f"pass_i: {pass_i}, cond_embeddings_expanded.shape: {cond_embeddings_expanded.shape}, pass_emb_expanded.shape: {pass_emb_expanded.shape}")
+                    assert pass_emb_expanded.shape == cond_embeddings_expanded.shape, \
+                        f"pass_emb_expanded.shape {pass_emb_expanded.shape} != cond_embeddings_expanded.shape {cond_embeddings_expanded.shape}"
+                if self.use_class_aware_adaLN and self.use_pass_aware_adaLN:
+                    # both class-aware and pass-aware adaLN
+                    cond_embeddings_expanded = cond_embeddings_expanded + pass_emb_expanded
+                elif not self.use_class_aware_adaLN and self.use_pass_aware_adaLN:
+                    # only pass-aware adaLN
+                    cond_embeddings_expanded = pass_emb_expanded
+
+                h = layer(h, cond_embeddings_expanded, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
+            else:
+                h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
         h = self.norm(h)
         logits = self.output(h).float()
         return logits
@@ -688,43 +814,110 @@ class Transformer(nn.Module):
                 known_f = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
                 h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
                 pred_feat = self.apply_knn_plan(knn_idx, knn_w, known_f)  # (B,M,C) in our case, M=N
-                h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
+                h_new = torch.cat((h_left, pred_feat, h_right), dim=1)
                 h = h_new
         
         elif self.pre_token_choose == 'transformer_choose' and not self.is_adaLN:
             # self.logger.info(f"Using normal TransformerBlock in input reordering blocks during training.")
             h_before_reorder = h.clone()
-            for pass_i, layer in enumerate(self.layers_inputreorder):
-                token_num_curr_pass = self.ori_masked_coords[pass_i+1].shape[0]
+            total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
+            # Iterate through all passes, but use shared modules
+            for pass_idx in range(total_passes):
+                # Determine which module to use (multiple passes share the same module)
+                module_idx = pass_idx // self.passes_per_module
+                layer = self.layers_inputreorder[module_idx]
+
+                # Get token count for current pass
+                token_num_curr_pass = self.ori_masked_coords[pass_idx + 1].shape[0]
+
                 h_left = h[:, :token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
                 h_curr_pass = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
                 h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
-                h_reordered = layer(h_curr_pass, 
-                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
-                                    input_pos, 
+
+                h_reordered = layer(h_curr_pass,
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device),
+                                    input_pos,
                                     mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
                 h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
                 h = h_new
         
         elif self.pre_token_choose == 'transformer_choose' and self.is_adaLN:
             h_before_reorder = h.clone()
-            for pass_i, layer in enumerate(self.layers_inputreorder):
-                token_num_curr_pass = self.ori_masked_coords[pass_i+1].shape[0]
+            total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
+            # Iterate through all passes, but use shared modules
+            for pass_idx in range(total_passes):
+                # Determine which module to use (multiple passes share the same module)
+                module_idx = pass_idx // self.passes_per_module
+                layer = self.layers_inputreorder[module_idx]
+
+                # Get token count for current pass
+                token_num_curr_pass = self.ori_masked_coords[pass_idx + 1].shape[0]
+
                 h_left = h[:, :token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
                 h_curr_pass = h[:, token_num_curr_pass: 2*token_num_curr_pass, :]  # (B, curr_pass_token_num, C)
                 h_right = h[:, 2*token_num_curr_pass:, :]  # (B, rest_token_num, C)
+
+                # Get pass embedding if enabled
+                pass_emb = None
+                if self.use_pass_aware_adaLN:
+                    batch_size = h.shape[0]
+                    pass_idx_tensor = torch.tensor([pass_idx], device=h.device).expand(batch_size)
+                    pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
+
                 h_reordered = layer(h_curr_pass, cond_embeddings,
-                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device), 
-                                    input_pos, 
-                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device))
+                                    self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device),
+                                    input_pos,
+                                    mask=torch.ones((token_num_curr_pass, token_num_curr_pass), dtype=torch.bool).to(h.device),
+                                    pass_emb=pass_emb)
                 h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
                 h = h_new
 
         assert self.auto_regr_struct.training_attention_mask is not None
 
+        # Process through backbone layers
+        if self.use_conditioned_blocks:
+            # When backbone uses pass-aware adaLN, prepare token-wise conditioning
+            # Expand class embedding to (B, L, C)
+            batch_size, seq_len, hidden_dim = h.shape
+            cond_embeddings_expanded = cond_embeddings[:, :self.cls_token_num, :].expand(batch_size, seq_len, hidden_dim)  # (B, L, C)
 
-        for layer in self.layers:
-            h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.training_attention_mask.to(h.device))
+            # Prepare pass embedding for each token based on which pass it belongs to
+            # total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
+            total_passes = len(self.auto_regr_struct.decoded_masked_coords)
+            pass_embeddings_list = []
+
+            if self.use_pass_aware_adaLN:
+                for pass_idx in range(total_passes):
+                    token_num_curr_pass = self.auto_regr_struct.decoded_masked_coords[pass_idx].shape[0]
+                    # Get pass embedding for this pass
+                    pass_idx_tensor = torch.tensor([pass_idx], device=h.device).expand(batch_size)
+                    pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
+                    # Expand to match the number of tokens in this pass
+                    pass_emb_expanded = pass_emb.expand(batch_size, token_num_curr_pass, hidden_dim)  # (B, token_num_curr_pass, C)
+                    pass_embeddings_list.append(pass_emb_expanded)
+
+                # Concatenate all pass embeddings: (B, total_tokens, C)
+                pass_embeddings_expanded = torch.cat(pass_embeddings_list, dim=1)  # (B, L, C)
+                assert pass_embeddings_expanded.shape == cond_embeddings_expanded.shape, \
+                    f"pass_embeddings_expanded.shape {pass_embeddings_expanded.shape} != cond_embeddings_expanded.shape {cond_embeddings_expanded.shape}"
+
+                
+            if self.use_class_aware_adaLN and self.use_pass_aware_adaLN:
+                # both class-aware and pass-aware adaLN
+                # self.logger.info(f"cond_embeddings_expanded.shape: {cond_embeddings_expanded.shape}, pass_embeddings_expanded.shape: {pass_embeddings_expanded.shape}")
+                cond_embeddings_expanded = cond_embeddings_expanded + pass_embeddings_expanded
+            elif not self.use_class_aware_adaLN and self.use_pass_aware_adaLN:
+                # only pass-aware adaLN
+                cond_embeddings_expanded = pass_embeddings_expanded
+
+            # Process through each layer with token-wise conditioning
+            for layer in self.layers:
+                h = layer(h, cond_embeddings_expanded, assem_freqs_cis, input_pos,
+                         self.auto_regr_struct.training_attention_mask.to(h.device))
+        else:
+            # Original processing without token-wise pass-aware conditioning
+            for layer in self.layers:
+                h = layer(h, assem_freqs_cis, input_pos, self.auto_regr_struct.training_attention_mask.to(h.device))
         
         h = self.norm(h)
         logits = self.output(h).float()
@@ -759,6 +952,9 @@ class Transformer(nn.Module):
         assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
         bs = cond_idx.shape[0]
         cond_lenn = self.cls_token_num
+        
+        decoding_schedule = self.auto_regr_struct.decoding_schedule
+        bs_ori = bs
         decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
         if cfg_scales[-1] > 1.0:
             cond_null = torch.ones_like(cond_idx) * self.num_classes
@@ -784,8 +980,6 @@ class Transformer(nn.Module):
         input_token_config = list(self.auto_regr_struct.token_map.input_tokens())
         output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.output_tokens())}
         
-        decoding_schedule = self.auto_regr_struct.decoding_schedule
-
         for decoding_step in range(len(decoding_schedule)):
             next_decoded_token_group = decoding_schedule[decoding_step]
             # next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
@@ -799,7 +993,7 @@ class Transformer(nn.Module):
                 
                 if input_token_type == TokenType.IMAGE:
                     tmp = output_token_config[input_token] # tmp是前序token在output tokens中的位置
-                    img_emb = self.tok_embeddings(decoded_indices[:, tmp])   # [bs, dim]
+                    img_emb = self.tok_embeddings(decoded_indices[bs_ori*(decoding_step-1):bs_ori*(decoding_step), tmp])   # [bs, dim]
                     if cfg_scales[-1] > 1.0:
                         img_emb = torch.cat([img_emb, img_emb], dim=0)       # [2*bs, dim]
                     next_embeddings[:, idx, :] = img_emb
@@ -842,10 +1036,6 @@ class Transformer(nn.Module):
         decoded_indices = decoded_indices[:, image_mask]
 
         _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
-        # if dist.get_rank() == 0:
-        #     print('#'*50)
-        #     print(f"back_order: {back_order}")
-        #     print('#'*50)
         final_decoded_indices = decoded_indices[:, back_order]
         return final_decoded_indices
             
@@ -998,11 +1188,17 @@ def GPT_L(**kwargs):
 
 def GPT_B(**kwargs):
     return Transformer(ModelArgs(n_layer=12, n_head=12, dim=768, **kwargs)) # 111M
+
+def GPT_Bcond(**kwargs):
+    return Transformer(ModelArgs(n_layer=12, n_head=12, dim=768, use_conditioned_blocks=True, **kwargs)) # 111M + adaLN
+
+def GPT_Bn1(**kwargs):
+    return Transformer(ModelArgs(n_layer=13, n_head=12, dim=768, **kwargs)) # >111M
         
 
 GPT_models = {
-    'GPT-B': GPT_B, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
-    'GPT-1B': GPT_1B, 'GPT-3B': GPT_3B, 'GPT-7B': GPT_7B, 
+    'GPT-Bn1': GPT_Bn1, 'GPT-B': GPT_B, 'GPT-Bcond': GPT_Bcond, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
+    'GPT-1B': GPT_1B, 'GPT-3B': GPT_3B, 'GPT-7B': GPT_7B,
 }
 
 
