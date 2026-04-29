@@ -2,8 +2,6 @@
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -25,7 +23,7 @@ import wandb
 import numpy as np
 
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root_dir = os.path.join(current_script_dir, '../../') # adjust the path based on your project structure
+project_root_dir = os.path.join(current_script_dir, '../../')
 project_root_dir = os.path.abspath(project_root_dir)
 
 if project_root_dir not in sys.path:
@@ -34,6 +32,7 @@ if project_root_dir not in sys.path:
 from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
+from utils.platform_config import configure_platform, detect_platform
 from dataset.build import build_dataset
 from autoregressive.models.gpt import GPT_models
 from autoregressive.models.utils.visulization import *
@@ -168,7 +167,10 @@ def print_model_summary(model, logger, seq_len, con_len, device):
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     
-    # Setup DDP:
+    platform_config = configure_platform()
+    args.platform = platform_config['platform']
+    args.compile_supported = platform_config['compile_supported']
+    
     init_distributed_mode(args)
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
@@ -441,9 +443,12 @@ def main(args):
         else:
             scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    if not args.no_compile:
+    if not args.no_compile and args.compile_supported:
         logger.info("compiling the model... (may take several minutes)")
-        model = torch.compile(model) # requires PyTorch 2.0
+        model = torch.compile(model)
+    elif not args.no_compile and not args.compile_supported:
+        logger.info(f"torch.compile is not supported on {args.platform} platform, skipping compilation")
+        args.no_compile = True
 
     model = DDP(model.to(device), device_ids=[args.gpu])
     
@@ -453,8 +458,11 @@ def main(args):
         ema.eval()  # EMA model should always be in eval mode
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
-    # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+    if args.mixed_precision == 'bf16':
+        scaler = torch.amp.GradScaler('cuda', enabled=False)
+        logger.info("Using bf16 mixed precision, GradScaler disabled")
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
 
     logger.info(f"Training for {args.epochs} epochs...")
 

@@ -9,63 +9,16 @@ bash /mnt/afs/zhengmingkai/zyr/AdamAR/scripts/autoregressive/extract_codes_c2i.s
 # training with augmented data and load a pretrained chkpt, train it with learning rate scheduler on GPU
 # train and generate tokens in each pass in parallel
 
-bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/train_c2i.sh \
-    --cloud-save-path /mnt/datasets/AdamAR-GPU/cloud_save \
-    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode/imagenet_code_256_c2i_flip_ten_crop \
-    --num-data 256 \
-    --image-size 256 --adam-block-size 8 --subpass-len 4 \
+bash /mnt/afs/zhengmingkai/zyr/AdamAR-Yiran/scripts/autoregressive/train_c2i.sh \
+    --cloud-save-path /mnt/datasets/AdamAR-Yiran/cloud_save \
+    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode2/imagenet_code_256_c2i_flip_ten_crop \
+    --image-size 256 --adam-block-size 8 --pre_token_choose close_min \
+    --freqs_cis_reorder_shceme output_reorder --interlacing_type adam --use_pass_aware_adaLN --use_class_aware_adaLN \
     --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B \
-    --global-batch-size 256 --lr 0.0001 --epochs 1 \
-    --ckpt-every 25 --log-every 1 \
+    --gpt-model GPT-B --gpt-type c2i \
+    --global-batch-size 2048 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 400 \
+    --ckpt-every 100 --log-every 100 \
     --no-compile --is-wandb-log --wandb_offline
-
-bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/train_c2i.sh \
-    --cloud-save-path /mnt/datasets/AdamAR-GPU/cloud_save \
-    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode/imagenet_code_256_c2i_flip_ten_crop \
-    --image-size 256 --adam-block-size 8 --subpass-num 4 --pre_token_choose close_min \
-    --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B --gpt-ckpt /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/results/010-GPT-B/checkpoints/0150120.pt \
-    --global-batch-size 256 --lr 0.0001 --epochs 100 --warmup_percent 0.01 --is-lr-scheduler \
-    --ckpt-every 20 --log-every 100 \
-    --no-compile --is-wandb-log --wandb_offline
-
-
-
-bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/train_c2i.sh \
-    --cloud-save-path /mnt/datasets/AdamAR-GPU/cloud_save \
-    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode/imagenet_code_256_c2i_flip_ten_crop \
-    --image-size 256 --adam-block-size 8 --subpass-len 4 --pre_token_choose close_min \
-    --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B --gpt-ckpt /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/results/010-GPT-B/checkpoints/0150120.pt \
-    --global-batch-size 256 --lr 0.0001 --epochs 100 --warmup_percent 0.01 --is-lr-scheduler \
-    --ckpt-every 20 --log-every 100 \
-    --no-compile --is-wandb-log --wandb_offline
-    
-
-bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/train_c2i.sh \
-    --cloud-save-path /mnt/datasets/AdamAR-GPU/cloud_save \
-    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode/imagenet_code_256_c2i_flip_ten_crop \
-    --image-size 256 --adam-block-size 8 --subpass-len 4 --pre_token_choose close_left_up \
-    --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B --gpt-ckpt /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/results/010-GPT-B/checkpoints/0150120.pt \
-    --global-batch-size 256 --lr 0.0001 --epochs 100 --warmup_percent 0.01 --is-lr-scheduler \
-    --ckpt-every 20 --log-every 100 \
-    --no-compile --is-wandb-log --wandb_offline
-
-
-
-bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/train_c2i.sh \
-    --cloud-save-path /mnt/datasets/AdamAR-GPU/cloud_save \
-    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode/imagenet_code_256_c2i_flip_ten_crop \
-    --image-size 256 --adam-block-size 8 --pre_token_choose close_left_up \
-    --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B \
-    --global-batch-size 256 --lr 0.0001 --epochs 100 \
-    --ckpt-every 20 --log-every 100 \
-    --no-compile --is-wandb-log --wandb_offline
-
-
 
 
 # Sampling

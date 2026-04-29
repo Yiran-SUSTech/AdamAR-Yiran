@@ -1,6 +1,7 @@
 import os
 import torch
 import subprocess
+from .platform_config import get_comm_backend, detect_platform
 
 
 def setup_for_distributed(is_master):
@@ -49,7 +50,7 @@ def init_distributed_mode(args):
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
+    args.dist_backend = get_comm_backend()
     print('| distributed init (rank {}): {}'.format(
         args.rank, args.dist_url), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
