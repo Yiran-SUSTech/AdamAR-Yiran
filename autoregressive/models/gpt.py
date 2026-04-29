@@ -18,7 +18,13 @@ from utils.drop_path import DropPath
 from autoregressive.models.utils.tokens import TokenType
 from autoregressive.models.generate import sample
 from autoregressive.models.utils.adam import get_autoregressive_structure
-from torch.nn.attention import sdpa_kernel, SDPBackend
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    HAS_NEW_SDP = True
+except ImportError:
+    HAS_NEW_SDP = False
+    import torch.backends.cuda
 
 from autoregressive.models.utils.visulization import *
 
@@ -1135,8 +1141,12 @@ class Transformer(nn.Module):
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
             # logits = self.forward_inference(x, freqs_cis, input_pos)
-            with sdpa_kernel(SDPBackend.MATH):
-                logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step, cond_emb_adaLN = cond_emb_adaLN)
+            if HAS_NEW_SDP:
+                with sdpa_kernel(SDPBackend.MATH):
+                    logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step, cond_emb_adaLN = cond_emb_adaLN)
+            else:
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step, cond_emb_adaLN = cond_emb_adaLN)
             # if dist.get_rank() == 0:
             #     print(f"logits.shape: {logits.shape}, num_decoded_tokens: {num_decoded_tokens}")
             if cfg_scales[-1] > 1.0:
