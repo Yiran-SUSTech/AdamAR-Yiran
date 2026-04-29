@@ -458,11 +458,10 @@ def main(args):
         ema.eval()  # EMA model should always be in eval mode
 
     ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
+    # GradScaler is only needed for fp16, not for bf16
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
     if args.mixed_precision == 'bf16':
-        scaler = torch.amp.GradScaler('cuda', enabled=False)
         logger.info("Using bf16 mixed precision, GradScaler disabled")
-    else:
-        scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == 'fp16'))
 
     logger.info(f"Training for {args.epochs} epochs...")
 
