@@ -44,7 +44,7 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     initializer_range: float = 0.02
-    
+
     token_dropout_p: float = 0.1
     attn_dropout_p: float = 0.0
     resid_dropout_p: float = 0.1
@@ -77,6 +77,8 @@ class ModelArgs:
     num_inputreorder_modules: int = None  # number of modules in layers_inputreorder, must be a divisor of (len(ori_masked_coords)-1), None means use all passes
     use_pass_aware_adaLN: bool = False  # whether to use pass-aware adaLN in ConditionedEnhancementBlock (add pass_idx as additional condition)
     use_class_aware_adaLN: bool = False  # whether to use class-aware adaLN in ConditionedEnhancementBlock (add class label as additional condition)
+    use_kq_norm: bool = False  # whether to apply RMSNorm to queries/keys (KQ-norm)
+    class_pass_emb_dim: int = None  # if not None, the dimension of class and pass embedding for adaLN modulation, default to model dim
 
 
 #################################################################################
@@ -228,6 +230,8 @@ class KVCache(nn.Module):
         cache_shape = (max_batch_size, n_head, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.__flops__ = 0
+        self.__macs__ = 0
 
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
@@ -249,7 +253,15 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
         total_kv_dim = (self.n_head + 2 * self.n_kv_head) * self.head_dim
-        
+
+        self.use_kq_norm = config.use_kq_norm
+        if self.use_kq_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
         # if dist.get_rank() == 0:
         #     print("-"*50)
         #     print(f"dim: {self.dim}, Attention: n_head: {self.n_head}, n_kv_head: {self.n_kv_head}, head_dim: {self.head_dim}, total_kv_dim: {total_kv_dim}")
@@ -276,7 +288,11 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_head, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_kv_head, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_head, self.head_dim)
-        
+
+        if self.use_kq_norm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         xq = apply_rotary_emb(xq, freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis)
 
@@ -324,18 +340,19 @@ class ConditionedEnhancementBlock(nn.Module):
     def __init__(self, config: ModelArgs, drop_path: float):
         super().__init__()
         self.attention = Attention(config)
-        self.feed_forward = FeedForward(config) # 保留 FFN
+        self.feed_forward = FeedForward(config) # FFN
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps) 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         # AdaLN 调制层：用于生成 Attention 和 FFN 的 shift, scale, gate
-        # 需要 3 * hidden_size for Attention (shift, scale, gate)
+        # 我们需要 3 * hidden_size for Attention (shift, scale, gate)
         #              3 * hidden_size for FFN (shift, scale, gate)
         # 总共 6 * hidden_size
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), # SiLU 激活函数
-            nn.Linear(config.dim, 6 * config.dim, bias=True)
+            nn.Linear(config.class_pass_emb_dim if (config.class_pass_emb_dim != config.dim and config.class_pass_emb_dim != None) else config.dim,
+                    6 * config.dim, bias=True)
         )
 
     def forward(
@@ -409,6 +426,7 @@ class Transformer(nn.Module):
         self.num_inputreorder_modules = config.num_inputreorder_modules  # number of modules in layers_inputreorder
         self.use_class_aware_adaLN = config.use_class_aware_adaLN  # whether to use pass-aware adaLN
         self.use_pass_aware_adaLN = config.use_pass_aware_adaLN  # whether to use pass-aware adaLN
+        self.class_pass_emb_dim = config.class_pass_emb_dim if config.class_pass_emb_dim is not None else config.dim  # dimension of class and pass embedding for adaLN modulation
         ######################################################
         if self.model_type == 'c2i':
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
@@ -438,8 +456,14 @@ class Transformer(nn.Module):
         if self.use_pass_aware_adaLN:
             # total_passes = len(self.ori_masked_coords)
             total_passes = len(self.auto_regr_struct.decoded_masked_coords) # 7 levels - 10 passes
-            self.pass_embedding = PassEmbedder(num_passes=total_passes, hidden_size=config.dim)
-            self.logger.info(f"Created PassEmbedder for {total_passes} passes")
+            self.pass_embedding = PassEmbedder(num_passes=total_passes, hidden_size=self.class_pass_emb_dim)
+            self.logger.info(f"Created PassEmbedder for {total_passes} passes, and the embedding dimension is {self.class_pass_emb_dim}")
+        
+        # Class embedding for class-aware adaLN
+        if self.use_class_aware_adaLN and self.class_pass_emb_dim != config.dim:
+            self.cls_adaLN_emb = LabelEmbedder(config.num_classes, self.class_pass_emb_dim, config.class_dropout_prob)
+            self.logger.info(f"Created ClassEmbedder in AdaLN for {config.num_classes} classes, and the embedding dimension is {self.class_pass_emb_dim}")
+
 
         # Precompute KNN plan
         if self.pre_token_choose == 'knn':
@@ -514,7 +538,9 @@ class Transformer(nn.Module):
         SinusoidalPosEmb_2d = torch.tensor(SinusoidalPosEmb_2d)
         assemble_SinusoidalPosEmb_2d = self.auto_regr_struct.assemble_sinusoidal_positional_embedding(SinusoidalPosEmb_2d)
         self.register_buffer('assemble_SinusoidalPosEmb_2d', assemble_SinusoidalPosEmb_2d)
-
+        # if dist.get_rank() == 0:
+        #     print(f"self.assemble_SinusoidalPosEmb_2d.shape: {self.assemble_SinusoidalPosEmb_2d.shape}")
+        #     print(f"self.freqs_cis.shape: {self.freqs_cis.shape}")
         # KVCache
         self.max_batch_size = -1
         self.max_seq_length = -1
@@ -583,6 +609,8 @@ class Transformer(nn.Module):
         for pass_i, query_xy in enumerate(decoded_masked_coords):
             if pass_i == 0:
                 continue
+            # if dist.get_rank() == 0:
+            #     logging.info(f"decoded_masked_coords[:pass_i] {decoded_masked_coords[:pass_i]} / pass_i {pass_i}")
             known_xy = torch.cat(decoded_masked_coords[:pass_i], dim=0)
             idx, w = self.precompute_knn_plan_one_passes(known_xy.to(dtype=torch.float32), query_xy.to(dtype=torch.float32), k=3, weight="idw", p=2.0, eps=1e-8, chunk_q=65536)
             all_knn_idxs.append(idx)
@@ -672,10 +700,15 @@ class Transformer(nn.Module):
         causal_mask = torch.zeros(self.max_seq_length, self.max_seq_length, dtype=torch.bool)
         grid_size = self.auto_regr_struct.training_attention_mask.shape[0]
         grid_size = int(grid_size)
+        # if dist.get_rank() == 0:
+        #     print(f"grid_size: {grid_size}, self.max_seq_length: {self.max_seq_length}")
         causal_mask[:grid_size, :grid_size] = self.auto_regr_struct.training_attention_mask
         causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
         self.register_buffer('causal_mask', causal_mask)
-        
+        # grid_size = int(self.config.block_size ** 0.5)
+        # assert grid_size * grid_size == self.block_size
+        # self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
+
     def forward(
         self, 
         idx: torch.Tensor, 
@@ -694,7 +727,8 @@ class Transformer(nn.Module):
                           cond_embeddings: torch.Tensor,
                           freqs_cis: torch.Tensor, 
                           input_pos: torch.Tensor,
-                          pass_i: int = None):
+                          pass_i: int = None,
+                          cond_emb_adaLN: Optional[torch.Tensor] = None,):
         """ Args:
             x: [bs, query_num, dim] Input tokens
             freqs_cis: [bs, query_num, n_head, dim // n_head] Frequency embeddings
@@ -702,12 +736,41 @@ class Transformer(nn.Module):
         """
 
         # TODO: add support for KV cache using input_pos 
-
+        # if dist.get_rank() == 0:
+        #     print("^"*50)
+        #     print(f"input_pos inside forward_inference: {input_pos}")
+        #     print(f"cond_embeddings.shape inside forward_inference: {cond_embeddings.shape}")
+        #     print(f"cond_embeddings.dtype inside forward_inference: {cond_embeddings.dtype}")
+        #     print(f"x.shape inside forward_inference: {x.shape}")
+        #     print(f"x.dtype inside forward_inference: {x.dtype}")
+        #     print(f"freqs_cis.shape inside forward_inference: {freqs_cis.shape}")
+        #     print("^"*50)
         
         assert self.auto_regr_struct.training_attention_mask is not None
+        # mask = self.auto_regr_struct.training_attention_mask[:x.shape[1], :x.shape[1]].to(x.device)
+        # if dist.get_rank() == 0:
+        #     print(f"self.assemble_SinusoidalPosEmb.device: {self.assemble_SinusoidalPosEmb.device}")
+        #     print(f"self.assemble_SinusoidalPosEmb.dtype: {self.assemble_SinusoidalPosEmb.dtype}")
+        #     print(f"input_pos.device: {input_pos.device}")
+        #     print(f"input_pos.dtype: {input_pos.dtype}")
+        #     print(f"self.causal_mask.device: {self.causal_mask.device}")
+        #     print(f"self.causal_mask.dtype: {self.causal_mask.dtype}")
+        #     print(f"x.dtype: {x.dtype}")
+        #     print(f"freqs_cis.dtype: {freqs_cis.dtype}")
+            
         mask = self.causal_mask[:x.shape[0], None, input_pos]
-
+        # if dist.get_rank() == 0:
+        #     print(f'mask.shape inside forward_inference: {mask.shape}')
+        #     print(f'mask[0].shape inside forward_inference: {mask.shape[0]}')
+        #     visualize_attention_mask(
+        #         attention_mask=mask[0, 0],
+        #         experiment_dir=self.sample_folder_dir,
+        #         mask_i = pass_i
+        #     )
         h = x
+        if cond_emb_adaLN is None:
+            cond_emb_adaLN = cond_embeddings
+            
         if self.target_aware_emb:
             pos_emb = self.assemble_SinusoidalPosEmb_2d
             delta_h = self.pos_emb_mlp(pos_emb) 
@@ -760,15 +823,15 @@ class Transformer(nn.Module):
                 batch_size, seq_len, hidden_dim = h.shape # seq_len is current pass token num
 
                 # Expand class embedding to (B, L, C)
-                cond_embeddings_expanded = cond_embeddings[:, :self.cls_token_num, :].expand(batch_size, seq_len, hidden_dim)
+                cond_embeddings_expanded = cond_emb_adaLN[:, :self.cls_token_num, :].expand(batch_size, seq_len, self.class_pass_emb_dim)
 
                 if self.use_pass_aware_adaLN:
                     # For inference, all tokens in current batch belong to the same pass
                     # pass_idx = pass_i - self.first_pass_token_num  # 0-indexed pass (excluding first pass)
                     pass_idx_tensor = torch.tensor([pass_i], device=h.device).expand(batch_size)
                     pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
-                    pass_emb_expanded = pass_emb.expand(batch_size, seq_len, hidden_dim)  # (B, L, C)
-                    self.logger.info(f"pass_i: {pass_i}, cond_embeddings_expanded.shape: {cond_embeddings_expanded.shape}, pass_emb_expanded.shape: {pass_emb_expanded.shape}")
+                    pass_emb_expanded = pass_emb.expand(batch_size, seq_len, self.class_pass_emb_dim)  # (B, L, C)
+                    # self.logger.info(f"pass_i: {pass_i}, cond_embeddings_expanded.shape: {cond_embeddings_expanded.shape}, pass_emb_expanded.shape: {pass_emb_expanded.shape}")
                     assert pass_emb_expanded.shape == cond_embeddings_expanded.shape, \
                         f"pass_emb_expanded.shape {pass_emb_expanded.shape} != cond_embeddings_expanded.shape {cond_embeddings_expanded.shape}"
                 if self.use_class_aware_adaLN and self.use_pass_aware_adaLN:
@@ -778,7 +841,7 @@ class Transformer(nn.Module):
                     # only pass-aware adaLN
                     cond_embeddings_expanded = pass_emb_expanded
 
-                h = layer(h, cond_embeddings_expanded, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
+                h = layer(h, cond_embeddings_expanded, freqs_cis, input_pos=input_pos, mask=mask[0, 0])
             else:
                 h = layer(h, freqs_cis, start_pos=input_pos, mask=mask[0, 0])
         h = self.norm(h)
@@ -795,6 +858,13 @@ class Transformer(nn.Module):
     ):
         assert targets is None
         cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
+
+        # prepare adaLN embedding of the class for ConditionedEnhancementBlock
+        if self.use_class_aware_adaLN and self.class_pass_emb_dim != self.config.dim:
+            cond_adaLN_emb = self.cls_adaLN_emb(cond_idx, train=self.training)[:,:self.cls_token_num]
+        else:
+            cond_adaLN_emb = None
+
         token_embeddings = self.tok_embeddings(idx)
         assem_input_embeddings, assem_freqs_cis = self.auto_regr_struct.assemble_input_tokens(token_embeddings, cond_embeddings, self.learnable_pos_embedding, self.freqs_cis.to(idx.device))
 
@@ -842,6 +912,7 @@ class Transformer(nn.Module):
                 h = h_new
         
         elif self.pre_token_choose == 'transformer_choose' and self.is_adaLN:
+            # self.logger.info(f"Using ConditionedEnhancementBlock in input reordering during training.")
             h_before_reorder = h.clone()
             total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
             # Iterate through all passes, but use shared modules
@@ -864,6 +935,7 @@ class Transformer(nn.Module):
                     pass_idx_tensor = torch.tensor([pass_idx], device=h.device).expand(batch_size)
                     pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
 
+                # self.logger.info(f"cond_embeddings.shape: {cond_embeddings.shape}")
                 h_reordered = layer(h_curr_pass, cond_embeddings,
                                     self.freqs_cis[self.cls_token_num:self.cls_token_num+token_num_curr_pass].to(h.device),
                                     input_pos,
@@ -872,6 +944,13 @@ class Transformer(nn.Module):
                 h_new = torch.cat((h_left, h_reordered, h_right), dim=1)
                 h = h_new
 
+            # compare = (h_before_reorder == h)
+            # if dist.get_rank() == 0:
+            #     print(f"total number of tokens in the first pass: {compare[:,:4,:].numel()}")
+            #     print(f"After transformer-based input reordering, number of unchanged in the first pass: {compare[:,:4,:].sum().item()}")
+            #     print(f"unchanged in the following pass: {compare[:,4:,:].sum().item()}")
+
+
         assert self.auto_regr_struct.training_attention_mask is not None
 
         # Process through backbone layers
@@ -879,7 +958,10 @@ class Transformer(nn.Module):
             # When backbone uses pass-aware adaLN, prepare token-wise conditioning
             # Expand class embedding to (B, L, C)
             batch_size, seq_len, hidden_dim = h.shape
-            cond_embeddings_expanded = cond_embeddings[:, :self.cls_token_num, :].expand(batch_size, seq_len, hidden_dim)  # (B, L, C)
+            if self.use_class_aware_adaLN and cond_adaLN_emb is not None:
+                cond_embeddings_expanded = cond_adaLN_emb[:, :self.cls_token_num, :].expand(batch_size, seq_len, self.class_pass_emb_dim)  # (B, L, C)
+            else:
+                cond_embeddings_expanded = cond_embeddings[:, :self.cls_token_num, :].expand(batch_size, seq_len, self.class_pass_emb_dim)  # (B, L, C)
 
             # Prepare pass embedding for each token based on which pass it belongs to
             # total_passes = len(self.ori_masked_coords) - 1  # exclude first pass
@@ -893,7 +975,7 @@ class Transformer(nn.Module):
                     pass_idx_tensor = torch.tensor([pass_idx], device=h.device).expand(batch_size)
                     pass_emb = self.pass_embedding(pass_idx_tensor)  # (B, 1, C)
                     # Expand to match the number of tokens in this pass
-                    pass_emb_expanded = pass_emb.expand(batch_size, token_num_curr_pass, hidden_dim)  # (B, token_num_curr_pass, C)
+                    pass_emb_expanded = pass_emb.expand(batch_size, token_num_curr_pass, self.class_pass_emb_dim)  # (B, token_num_curr_pass, C)
                     pass_embeddings_list.append(pass_emb_expanded)
 
                 # Concatenate all pass embeddings: (B, total_tokens, C)
@@ -952,10 +1034,15 @@ class Transformer(nn.Module):
         assembled_freq_cis = self.auto_regr_struct.assemble_positional_embedding(self.freqs_cis)
         bs = cond_idx.shape[0]
         cond_lenn = self.cls_token_num
-        
+        ############################################################################################################################
         decoding_schedule = self.auto_regr_struct.decoding_schedule
         bs_ori = bs
+        ############################################################################################################################
+        ############################################################################################################################
         decoded_indices = torch.zeros((bs, len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
+                        # for check pass-wise image generation
+        # decoded_indices = torch.zeros((bs_ori*len(decoding_schedule), len(self.auto_regr_struct.token_map)), dtype=torch.long, device=cond_idx.device)
+        ############################################################################################################################
         if cfg_scales[-1] > 1.0:
             cond_null = torch.ones_like(cond_idx) * self.num_classes
             cond_combined = torch.cat([cond_idx, cond_null])
@@ -965,6 +1052,13 @@ class Transformer(nn.Module):
         
     
         cond_combined_tokens = self.cls_embedding(cond_combined, train=False)
+
+        # if adaLN embedding dimension is different from model hidden dimension, we need to project it to the same dimension for addition
+        if self.use_class_aware_adaLN and self.class_pass_emb_dim != self.config.dim:
+            cond_emb_adaLN = self.cls_adaLN_emb(cond_combined, train=False)
+        else:
+            cond_emb_adaLN = None
+            
         x = torch.empty([bs, 0, self.config.dim], device=cond_idx.device, dtype=cond_combined_tokens.dtype)
         if self.target_aware_emb:
             self.assemble_SinusoidalPosEmb_2d = self.assemble_SinusoidalPosEmb_2d.to(dtype=cond_combined_tokens.dtype)
@@ -972,6 +1066,7 @@ class Transformer(nn.Module):
             
         # TODO: add support for KV cache (below code is from RandAR)
         # Step-4: KV Cache setup
+        # max_seq_len = cond_combined_tokens.shape[1] + self.block_size
         max_seq_len = self.block_size
         with torch.device(cond_idx.device):
             self.setup_caches(max_batch_size=bs, max_seq_length=max_seq_len, dtype=self.tok_embeddings.weight.dtype)
@@ -980,6 +1075,12 @@ class Transformer(nn.Module):
         input_token_config = list(self.auto_regr_struct.token_map.input_tokens())
         output_token_config = {v: k for k, v in enumerate(self.auto_regr_struct.token_map.output_tokens())}
         
+        ########################################################################
+        # pre_indics = None     # for check pass-wise image generation
+        # decoding_mask = []    # for check pass-wise image generation
+        # rows_cols = []        # for check pass-wise image generation
+        ########################################################################
+
         for decoding_step in range(len(decoding_schedule)):
             next_decoded_token_group = decoding_schedule[decoding_step]
             # next_embeddings = torch.zeros((decoded_indices.shape[0], len(next_decoded_token_group ), self.config.dim), dtype=x.dtype, device=x.device)
@@ -993,9 +1094,17 @@ class Transformer(nn.Module):
                 
                 if input_token_type == TokenType.IMAGE:
                     tmp = output_token_config[input_token] # tmp是前序token在output tokens中的位置
-                    img_emb = self.tok_embeddings(decoded_indices[bs_ori*(decoding_step-1):bs_ori*(decoding_step), tmp])   # [bs, dim]
+                    # next_embeddings[:, idx, :] = self.tok_embeddings(decoded_indices[:, tmp])
+                    ########################################################################
+                    img_emb = self.tok_embeddings(decoded_indices[:, tmp])   # [bs, dim]
+                    # img_emb = self.tok_embeddings(decoded_indices[bs_ori*(decoding_step-1):bs_ori*(decoding_step), tmp])   # [bs, dim] # for check pass-wise image generation
+                    ########################################################################
                     if cfg_scales[-1] > 1.0:
                         img_emb = torch.cat([img_emb, img_emb], dim=0)       # [2*bs, dim]
+                    ############################################################################
+                    # print(f"next_embeddings.shap: {next_embeddings.shape}, img_emb.shape: {img_emb.shape}, idx: {idx}, tmp: {tmp}")
+                    # print(f"decoded_indices[bs_ori*(decoding_step-1):bs_ori*(decoding_step), tmp]: {decoded_indices[bs_ori*(decoding_step-1):bs_ori*(decoding_step), tmp]}")
+                    ############################################################################
                     next_embeddings[:, idx, :] = img_emb
                 elif input_token_type == TokenType.LEARNED:
                     next_embeddings[:, idx, :] = self.learnable_pos_embedding[None, None]
@@ -1006,37 +1115,133 @@ class Transformer(nn.Module):
                     
                 
 
+            # x = torch.cat([x, next_embeddings], dim=1)
+            # input_pos = torch.cat([input_pos, torch.tensor(next_decoded_token_group, device=cond_idx.device)], dim=0)
+            # freqs_cis = assembled_freq_cis[input_pos]
+            
+            # next_embeddings are the embeddings of the input tokens
+            # input_pos should be the position index of the input tokens in the input sequence
             input_pos = torch.tensor(next_decoded_token_group, device=cond_idx.device)
             freqs_cis = assembled_freq_cis[input_pos]
-
+            # if dist.get_rank() == 0:
+            #     print(f"input_pos: {input_pos}")
+            #     print(f'next_embeddings.shape[1]: {next_embeddings.shape[1]}, freqs_cis.shape[0]: {freqs_cis.shape[0]}')
+            #     print(f'next_embeddings.shape: {next_embeddings.shape}, freqs_cis.shape: {freqs_cis.shape}')
+        
+            # assert x.shape[1] == freqs_cis.shape[0]
             assert next_embeddings.shape[1] == freqs_cis.shape[0]
 
             decoded_token_group = decoding_schedule[decoding_step]
             num_decoded_tokens = len(decoded_token_group)
             query_token_idx_cur_step = decoded_token_group[num_decoded_tokens // 2]
+            # logits = self.forward_inference(x, freqs_cis, input_pos)
             with sdpa_kernel(SDPBackend.MATH):
-                logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step)
+                logits = self.forward_inference(next_embeddings, cond_combined_tokens, freqs_cis, input_pos, pass_i=decoding_step, cond_emb_adaLN = cond_emb_adaLN)
+            # if dist.get_rank() == 0:
+            #     print(f"logits.shape: {logits.shape}, num_decoded_tokens: {num_decoded_tokens}")
             if cfg_scales[-1] > 1.0:
                 cur_cfg_scale = cfg_scales[0] + (cfg_scales[-1] - cfg_scales[0]) * query_token_idx_cur_step / self.block_size
                 cond_logits, uncond_logits = torch.chunk(logits, 2, dim=0)
                 logits = uncond_logits + cur_cfg_scale * (cond_logits - uncond_logits)
 
+            # if dist.get_rank() == 0:
+            #     print(f"logits.shape: {logits.shape}, num_decoded_tokens: {num_decoded_tokens}")
             logits = logits[:, -num_decoded_tokens:] # [bs, query_num, vocab_size]
+            # if dist.get_rank() == 0:
+            #     print(f"logits.shape: {logits.shape}, num_decoded_tokens: {num_decoded_tokens}")
             
+            ###################################################################################
             indices = torch.zeros(decoded_indices.shape[0], num_decoded_tokens, dtype=torch.long, device=x.device)
+            # indices = torch.zeros(bs_ori, num_decoded_tokens, dtype=torch.long, device=x.device)  # for check pass-wise image generation
+            ###################################################################################
             for i in range(num_decoded_tokens):
                 indices[:, i : i + 1] = sample(logits[:, i : i + 1], temperature=temperature, top_k=top_k, top_p=top_p)[0]
 
+            
+            #################################################################################################
+            # if pre_indics is not None:                                                            # for check pass-wise image generation
+            #     decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1), :] += pre_indics   # for check pass-wise image generation
+            # last_idx = 0                                                                          # for check pass-wise image generation
+            #################################################################################################
             for idx, decoded_token_idx in enumerate(decoded_token_group):
                 decoded_indices[:, decoded_token_idx] = indices[:, idx]
-            
+            #--------------------for check pass-wise image generation--------------------#
+            '''
+                decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1), decoded_token_idx] = indices[:, idx] + 1
+                last_idx = decoded_token_idx
+            # print(f"indices: {indices}")
+            pre_indics = decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)]
+            # # fill the rest tokens with the last generated token
+            mask = None
+            if num_decoded_tokens > 1:
+                image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
+                assert image_mask.sum() == self.block_size
+                decoded_indices = decoded_indices[:, image_mask]
+                L = decoded_indices.shape[1]
+                N = last_idx + 1 # 目前为止decode了多少个token
+
+                _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
+                for idxx, _ in enumerate(decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)]):
+                    decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx] = decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx][back_order]
+                    mask = (decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx] != 0)
+                    valid_data = decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx][mask]
+                    rows = 2 ** int(math.log2(N) // 2) 
+                    cols = 2 ** int(math.log2(N) - int(math.log2(N) // 2))
+                    # print(f"Decoding step {decoding_step}, bs_ori: {bs_ori}, idxx: {idxx}, N: {N}, rows: {rows}, cols: {cols}, valid_data.shape: {valid_data.shape}")
+                    valid_data_2d = valid_data.reshape(rows, cols).to(dtype=torch.float32)
+                    valid_data_4d = valid_data_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, rows, cols)
+                    upsampled_tensor_4d = F.interpolate(
+                        valid_data_4d, 
+                        size=(int(L**0.5), int(L**0.5)), 
+                        mode='nearest')
+                    upsampled_tensor_2d = upsampled_tensor_4d.squeeze(0).squeeze(0)
+                    upsampled_tensor_1d = upsampled_tensor_2d.reshape(-1).to(dtype=torch.long)
+                    decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx] = upsampled_tensor_1d
+
+                    tmp_inv = torch.argsort(back_order)
+                    decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx] = decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)][idxx][tmp_inv] - 1
+                
+                decoding_mask.append(mask)
+                rows_cols.append((rows, cols))
+
+                # N = last_idx + 1
+                # # L = decoded_indices.shape[1]
+                # source_data = decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1), :N] # (bs_ori, N)
+                # R = decoded_indices.shape[1] // N
+                # print(f"decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)].shape: {decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)].shape}, source_data.shape: {source_data.shape}, R: {R}")
+                # print(f"torch.repeat_interleave(source_data, repeats=R, dim=1).shape: {torch.repeat_interleave(source_data, repeats=R, dim=1).shape}")
+                # decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1)] = torch.repeat_interleave(source_data, repeats=R, dim=1)
+            # target_len = L - N
+            # fill_indices = torch.arange(target_len) % N
+            # filled_values = source_data[:, fill_indices]
+            # decoded_indices[bs_ori*decoding_step:bs_ori*(decoding_step+1), N:] = filled_values
+            '''
         
         image_mask = (self.auto_regr_struct.token_map_tensors.out_token_types == TokenType.IMAGE.value)
         assert image_mask.sum() == self.block_size
         decoded_indices = decoded_indices[:, image_mask]
 
         _, back_order = self.auto_regr_struct.token_map_tensors.out_token_indices[image_mask].sort()
+        # if dist.get_rank() == 0:
+        #     print('#'*50)
+        #     print(f"back_order: {back_order}")
+        #     print('#'*50)
         final_decoded_indices = decoded_indices[:, back_order]
+        ###################################################################################
+        # print(f"final_decoded_indices[0:8]: {final_decoded_indices[0:8]}")
+        # print(f"final_decoded_indices[8:16]: {final_decoded_indices[8:16]}")
+        # print(f"final_decoded_indices[16:24]: {final_decoded_indices[16:24]}")
+        # print(f"final_decoded_indices[24:32]: {final_decoded_indices[24:32]}")
+        # print(f"final_decoded_indices[32:40]: {final_decoded_indices[32:40]}")
+        # print(f"decoded_indices[0:8]: {decoded_indices[0:8]}")
+        # print(f"decoded_indices[8:16]: {decoded_indices[8:16]}")
+        # print(f"decoded_indices[16:24]: {decoded_indices[16:24]}")
+        # print(f"decoded_indices[24:32]: {decoded_indices[24:32]}")
+        # print(f"decoded_indices[32:40]: {decoded_indices[32:40]}")
+        # tmp_inv = torch.argsort(back_order)                                     # for check pass-wise image generation
+        # return final_decoded_indices, decoding_mask, rows_cols, tmp_inv         # for check pass-wise image generation
+        ###################################################################################
+
         return final_decoded_indices
             
 #################################################################################
@@ -1148,7 +1353,13 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
-
+    # if dist.get_rank() == 0:
+    #     print("#"*50)
+    #     print(f"freqs_cis.shape inside apply_rotary_emb: {freqs_cis.shape}")
+    #     print(f"x.shape inside apply_rotary_emb: {x.shape}")
+    #     print(f"so according to x, bs: {x.shape[0]}, seq_len: {x.shape[1]}, n_head: {x.shape[2]}, head_dim: {x.shape[3]}")
+    #     print(f"and according to freqs_cis, seq_len: {freqs_cis.shape[0]}, head_dim // 2: {freqs_cis.shape[1]}")
+    #     print("#"*50)
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
     x_out2 = torch.stack([
@@ -1183,8 +1394,14 @@ def GPT_XXL(**kwargs):
 def GPT_XL(**kwargs):
     return Transformer(ModelArgs(n_layer=36, n_head=20, dim=1280, **kwargs)) # 775M
 
+def GPT_XLcond(**kwargs):
+    return Transformer(ModelArgs(n_layer=36, n_head=20, dim=1280, use_conditioned_blocks=True, **kwargs)) # 775M + adaLN
+
 def GPT_L(**kwargs):
     return Transformer(ModelArgs(n_layer=24, n_head=16, dim=1024, **kwargs)) # 343M
+
+def GPT_Lcond(**kwargs):
+    return Transformer(ModelArgs(n_layer=24, n_head=16, dim=1024, use_conditioned_blocks=True, **kwargs)) # 343M + adaLN
 
 def GPT_B(**kwargs):
     return Transformer(ModelArgs(n_layer=12, n_head=12, dim=768, **kwargs)) # 111M
@@ -1197,7 +1414,7 @@ def GPT_Bn1(**kwargs):
         
 
 GPT_models = {
-    'GPT-Bn1': GPT_Bn1, 'GPT-B': GPT_B, 'GPT-Bcond': GPT_Bcond, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
+    'GPT-Bn1': GPT_Bn1, 'GPT-B': GPT_B, 'GPT-Bcond': GPT_Bcond, 'GPT-L': GPT_L, 'GPT-Lcond': GPT_Lcond, 'GPT-XL': GPT_XL, 'GPT-XLcond': GPT_XLcond, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
     'GPT-1B': GPT_1B, 'GPT-3B': GPT_3B, 'GPT-7B': GPT_7B,
 }
 

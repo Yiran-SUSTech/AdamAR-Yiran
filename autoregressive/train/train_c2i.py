@@ -19,7 +19,7 @@ import time
 import inspect
 import argparse
 import math
-from ptflops import get_model_complexity_info
+from thop import profile, clever_format
 
 import wandb
 import numpy as np
@@ -100,7 +100,7 @@ def cleanup():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def print_model_summary(model, logger, seq_len):
+def print_model_summary(model, logger, seq_len, con_len, device):
     """
     打印模型每一层的名称和参数量。
     """
@@ -137,6 +137,14 @@ def print_model_summary(model, logger, seq_len):
     idx_dummy = torch.ones((1, L_idx), dtype=torch.long, device=device) 
     cond_idx_dummy = torch.ones((1,), dtype=torch.long, device=device)
 
+    # 重点：thop 要求输入的元组中**只包含张量**，因此 None 必须移除
+    # 假设你的 forward 函数为：raw_model(idx, cond_idx)
+    # 如果模型 forward(idx, cond_idx, input_pos, targets, valid) 
+    # 在推理模式下可以接受 None，你需要检查 thop 是否会因为 None 报错。
+    # 如果报错，请尝试定义一个只接受 (idx, cond_idx) 的 wrapper。
+
+    # 假设你的模型只使用前两个输入 (idx, cond_idx)
+    # ⚠️ 请确保这是你的模型 forward 函数所需的**全部且按顺序**的输入
     inputs = (idx_dummy, cond_idx_dummy) 
 
     # --- 2. 计算 MACs 和参数 ---
@@ -151,7 +159,7 @@ def print_model_summary(model, logger, seq_len):
     logger.info("Total Trainable Parameters: {:.2f} M".format(trainable_params / 1e6))
     logger.info("=" * 60)
 
-    logger.info(f"Model FLOPs: {macs}") # 结果以 GFlops 的形式显示
+    logger.info(f"Model FLOPs: {macs}") # 结果通常会以 GFlops 的形式显示
     logger.info(f"Model Params: {params}")
 
 #################################################################################
@@ -322,6 +330,8 @@ def main(args):
         num_inputreorder_modules=args.num_inputreorder_modules,
         use_pass_aware_adaLN=args.use_pass_aware_adaLN,
         use_class_aware_adaLN=args.use_class_aware_adaLN,
+        use_kq_norm=args.use_kq_norm,
+        class_pass_emb_dim=args.class_pass_emb_dim,
     ).to(device)
 
     # visualize passes and attention mask
@@ -402,10 +412,6 @@ def main(args):
 
     # Setup optimizer
     optimizer = create_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
-    scheduler = None
-    if args.is_lr_scheduler:
-        # Create a learning rate scheduler
-        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Prepare models for training:
     train_steps = 0
@@ -427,11 +433,20 @@ def main(args):
         if args.ema:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
 
+    scheduler = None
+    if args.is_lr_scheduler:
+        # Create a learning rate scheduler
+        if args.gpt_ckpt is not None:
+            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=train_steps - 1)
+        else:
+            scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model) # requires PyTorch 2.0
 
     model = DDP(model.to(device), device_ids=[args.gpu])
+    
 
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
@@ -520,6 +535,9 @@ def main(args):
                 log_steps = 0
                 start_time = time.time()
             
+    # log an image before the training
+    # log_image(args, latent_size, vq_model, model, logger, device, 0, rank=rank)
+
     dist.barrier()
     for epoch in range(start_epoch+1, args.epochs+1):
         sampler.set_epoch(epoch)
@@ -646,6 +664,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_inputreorder_modules", type=int, default=None, help="the number of input reorder modules for transformer_choose")
     parser.add_argument("--use_pass_aware_adaLN", action='store_true', default=False)
     parser.add_argument("--use_class_aware_adaLN", action='store_true', default=False)
+    parser.add_argument("--use_kq_norm", action='store_true', default=False, help="whether to use qk norm in attention")
+    parser.add_argument("--class_pass_emb_dim", type=int, default=None, help="the dimension of class and pass embedding when using pass-aware or class-aware AdaLN")
 
     args = parser.parse_args()
     main(args)

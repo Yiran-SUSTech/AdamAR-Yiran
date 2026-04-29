@@ -88,6 +88,24 @@ def get_adam_pattern(
 
             patterns.append((x_start, y_start, x_stride, y_stride))
 
+    ####################################
+    # if dist.get_rank() == 0:
+    #     print("#"*50)
+    #     print("Adam patterns (x_start, y_start, x_step, y_step):")
+    #     for i, pattern in enumerate(patterns):
+    #         print(f"Pass {i}: {pattern}")
+    #     print("Adam shift patterns:")
+    #     print("#"*50)
+    #     for i, shift_pattern in enumerate(shift_patterns):
+    #         print(f"Pass {i} shifts:")
+    #         for key, sp in shift_pattern.items():
+    #             print(f"  {key}: (x_shift={sp.x_shift}, y_shift={sp.y_shift})")
+    #     print("#"*50)
+    ####################################
+
+    # assert len(shift_patterns) == num_passes - 1, (
+    #     "shift_patterns must have length num_passes - 1"
+    # )
     return patterns, shift_patterns
 
 def get_quadrants(col:int, row:int, image_width: int, image_height: int) -> int:
@@ -106,6 +124,7 @@ def generalized_adam_interlacing(logger, width: int, height: int, base_block_siz
     assert width % base_block_size == 0 and height % base_block_size == 0, (
         "width and height must be divisible by block size in this implementation"
     )
+    logger.info(f"Generating {interlacing_type} interlacing pattern in adam.generalized_adam_interlacing for image of size ({width}, {height}) with base block size {base_block_size}")
 
     patterns, shift_patterns = get_adam_pattern(base_block_size)
     adam_masks: list[torch.Tensor] = []
@@ -121,8 +140,10 @@ def generalized_adam_interlacing(logger, width: int, height: int, base_block_siz
                     mask[y, x] = True
                     filled[y, x] = True
                     if interlacing_type == "adam" or interlacing_type == "corner_adam":
+                        # logger.info(f"using adam or corner_adam")
                         coords.append((x, y))
                     elif interlacing_type == "spin_adam":
+                        # logger.info(f"indeed using spin_adam")
                         quadrant = get_quadrants(x, y, width, height)
                         if quadrant == 0: # Top-left
                             x_new = int(width / 2 - 1 - y)
@@ -210,11 +231,16 @@ def set_subpass_by_len(adam_coords: list[torch.Tensor], subpass_len: int=1) -> l
     new_adam_coords = []
     assert subpass_len > 0, "subpass_len must be greater than 0"
     for pass_idx, adam_coord in enumerate(adam_coords):
+        if dist.get_rank() == 0:
+            print(f"Pass {pass_idx}: {adam_coord}")
         if pass_idx == 0: # do not mess up with the first pass
             new_adam_coords.append(adam_coord)
             continue
         # if subpass length is 0, then, it is serial generation within each pass
         assert len(adam_coord) % subpass_len == 0, "Each pass length must be divisible by subpass_len"
+        # tmp = adam_coord.reshape(-1, subpass_len, 2)
+        # tmp = tmp.transpose(0,1).reshape(-1, 2)
+        # autoregressive_n_step = tmp.split(len(adam_coord) // subpass_len, dim=0)
         autoregressive_n_step = adam_coord.split(subpass_len, dim=0)
         new_adam_coords += list(autoregressive_n_step)
     
@@ -277,6 +303,10 @@ def get_autoregressive_structure(
     first_image_token = ImageToken(
         x_coord=first_pass_coords[0][0], y_coord=first_pass_coords[0][1]
     )
+    logger.info(f"First image token at coord: ({first_pass_coords[0][0]}, {first_pass_coords[0][1]})")
+    logger.info(f"Second image token at coord: ({first_pass_coords[1][0]}, {first_pass_coords[1][1]})")
+    logger.info(f"Third image token at coord: ({first_pass_coords[2][0]}, {first_pass_coords[2][1]})")
+    logger.info(f"Fourth image token at coord: ({first_pass_coords[3][0]}, {first_pass_coords[3][1]})")
 
     # bi_attention_size, num_generated_tokens_per_pass seem not important 
     ################################
@@ -335,6 +365,8 @@ def get_autoregressive_structure(
                 closest_token = Pre_TOKEN_FUNCTION[pre_token_choose](
                     token_map, curr_img_token, generated_tokens, width
                 )
+            # if dist.get_rank() == 0:
+            #     print(f"closest previous token: ({closest_token.x_coord}, {closest_token.y_coord}), Current token: ({curr_img_token.x_coord}, {curr_img_token.y_coord})")
             token_map[closest_token] = curr_img_token  # 所以好几个token的前序token可能是相同的，这个相同的token在token_map中的_input_index会是一个列表，记录其被作为前序token的所有时刻
             visited_coords_idx += 1
 

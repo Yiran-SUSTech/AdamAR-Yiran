@@ -36,7 +36,55 @@ class AutoRegressiveStructure:
         self.decoding_schedule = self.get_decoding_schedule(decoded_masked_coords) # decoding_schedule其实是output token的index的list，也就是从0到total_len-1
         self.training_attention_mask = self.get_training_attention_mask(self.decoding_schedule)
         self.freqs_cis_reorder_shceme = freqs_cis_reorder_shceme
-          
+        
+        # if dist.get_rank() == 0:
+        #     print(f"len(token_map): {len(token_map)}") ##############################################
+        #     self.logger.info(f"len(token_map): {len(token_map)}")
+        #     num_output_image_tokens = 0
+        #     for i_pass, coords_i_pass in enumerate(decoded_masked_coords):
+        #         print(f"pass {i_pass}:")
+        #         self.logger.info(f"pass {i_pass}:")
+        #         coords_n_indics = []
+        #         for coord in coords_i_pass.tolist():
+        #             x, y = coord
+        #             output_token_index = self.token_map.get_output_token_index((ImageToken(x, y)))
+        #             coords_n_indics.append([x,y,output_token_index])
+        #         print(coords_n_indics)
+        #         self.logger.info(coords_n_indics)
+        #         num_output_image_tokens += len(coords_i_pass.tolist())
+        #     print("^"*50)
+        #     self.logger.info("^"*50)
+        #     print("input token and corresponding output token indices:")
+        #     self.logger.info("input token and corresponding output token indices:")
+        #     print(f"total num input tokens: {len(self.token_map._input_index.keys())}")
+        #     self.logger.info(f"total num input tokens: {len(self.token_map._input_index.keys())}")
+        #     total_input_image_tokens = 0
+        #     for inp_token in self.token_map._input_index.keys():
+        #         if inp_token.token_type() != TokenType.IMAGE:
+        #             continue
+        #         output_token_indices = self.token_map._input_index[inp_token]
+        #         output_token_indices2 = self.token_map._input_index.get(inp_token, [])
+        #         output_token_indices3 = self.token_map.get_input_token_index(inp_token)
+        #         total_input_image_tokens += len(output_token_indices)
+        #         print(f"input token pos: [{inp_token.x_coord}, {inp_token.y_coord}] appeared {len(output_token_indices)} times in input sequence: {output_token_indices}")
+        #         self.logger.info(f"input token pos: [{inp_token.x_coord}, {inp_token.y_coord}] appeared {len(output_token_indices)} times in input sequence: {output_token_indices}")
+        #         print(f"output_token_indices2 from get method: {output_token_indices2}")
+        #         print(f"output_token_indices3 from get_input_token_index method: {output_token_indices3}")
+        #     print(f"total input image tokens: {total_input_image_tokens}")
+        #     self.logger.info(f"total input image tokens: {total_input_image_tokens}")
+        #     print("^"*50)
+        #     self.logger.info("^"*50)
+        #     print(f"num_output_image_tokens: {num_output_image_tokens}") ##############################################
+        #     self.logger.info(f"num_output_image_tokens: {num_output_image_tokens}")
+        #     print(f"Decoding schedule: {self.decoding_schedule}") ##############################################
+        #     self.logger.info(f"Decoding schedule: {self.decoding_schedule}")
+        #     print(f"training attention mask: {self.training_attention_mask}") ##############################################
+        #     self.logger.info(f"training attention mask: {self.training_attention_mask}")
+        #     print(f"shape of training attention mask: {self.training_attention_mask.shape}") ##############################################
+        #     self.logger.info(f"shape of training attention mask: {self.training_attention_mask.shape}")
+        #     print(f"token_map._data: {self.token_map._data}")
+        #     self.logger.info(f"token_map._data: {self.token_map._data}")
+        
     # @jaxtyped(typechecker=typechecker) (jaxtyped is not supported by torch.compile mode)
     def assemble_input_tokens(
         self,
@@ -68,6 +116,12 @@ class AutoRegressiveStructure:
         )
 
         reordered_image_tokens = image_tokens[:, image_indices, :]
+        # if dist.get_rank() == 0:
+        #     print(f"self.token_map_tensors.out_token_indices.shape[0]: {self.token_map_tensors.out_token_indices.shape[0]}")
+        #     print(f"self.token_map_tensors.in_token_indices.shape[0]: {self.token_map_tensors.in_token_indices.shape[0]}")
+        #     print(f"image_indices.shape: {image_indices.shape}") ##############################################
+        #     print(f"image_indices: {image_indices}")
+        #     print(f"length of image_indices: {len(image_indices)}, number of image tokens: {image_tokens.shape[1]}") ##############################################
 
         input_tokens[:, image_mask, :] = reordered_image_tokens
         input_tokens[:, learned_mask, :] = learnable_token
@@ -103,6 +157,24 @@ class AutoRegressiveStructure:
             new_freqs_cis = freqs_cis[:-1]
         else:
             assert False, f"Unknown freqs_cis_reorder_shceme: {self.freqs_cis_reorder_shceme}"
+                
+        # T_flat = new_freqs_cis.view(256, -1) 
+        # # T_flat 的形状现在是 [256, 16]
+
+        # # 步骤 2: 使用 unique(dim=0) 查找唯一的行
+        # # unique(dim=0) 会返回所有在第 0 维度上不重复的元素（即不重复的 [8, 2] 向量）
+        # T_unique = torch.unique(T_flat, dim=0)
+
+        # # 步骤 3: 比较唯一元素的数量与原始数量
+        # original_count = T_flat.shape[0]   # 256
+        # unique_count = T_unique.shape[0] # 唯一的 [8, 2] 张量数量
+
+        # # 最终判断
+        # has_duplicates = unique_count < original_count
+        # if dist.get_rank() == 0:
+        #     print(f"original_count: {original_count}")
+        #     print(f"unique_count: {unique_count}")
+        #     print(f"has_duplicates: {has_duplicates}")
         
         return new_freqs_cis
     
@@ -121,6 +193,9 @@ class AutoRegressiveStructure:
         )
         
         out_image_indices = self.token_map_tensors.out_token_indices[out_image_mask] + cond_lenn
+        if dist.get_rank() == 0:
+            print(f"out_image_indices.shape: {out_image_indices.shape}") ##############################################
+            print(f"out_image_indices: {out_image_indices}") ##############################################
         new_SinusoidalPosEmb = SinusoidalPosEmb[out_image_indices]
         
         return new_SinusoidalPosEmb
@@ -158,6 +233,12 @@ class AutoRegressiveStructure:
         target_tokens[:, image_mask] = reordered_image_token_idx
         target_mask[:, image_mask] = True
         
+        # if dist.get_rank() == 0:
+        #     print(f"target_tokens.shape: {target_tokens.shape}") ##############################################
+        #     print(f"target_mask.shape: {target_mask.shape}") ##############################################
+        #     print(f"image_mask: {image_mask}") ##############################################
+        #     print(f"empty_mask: {empty_mask}") ##############################################
+
         return target_tokens, target_mask
 
     def assemble_input_tokens_for_decoding(
@@ -242,3 +323,4 @@ class AutoRegressiveStructure:
             attention_mask[rows, cols] = 1
 
         return attention_mask
+    

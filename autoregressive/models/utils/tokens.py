@@ -376,3 +376,4 @@ def find_close_center_token(
 
     assert close_center_token is not None, "No closest token found"
     return close_center_token
+
