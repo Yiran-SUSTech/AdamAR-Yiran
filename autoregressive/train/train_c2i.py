@@ -484,15 +484,26 @@ def main(args):
         nonlocal running_loss, wandb_steps, logger, start_time
         model.train()
         for step, (data, target) in enumerate(loader):
+            data_start = time.time()
             data = data.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            data_time = time.time() - data_start
+            
+            # Monitor data loading bottleneck
+            if data_time * 1000 > 50:
+                print(f"[Rank {rank}] Data fetch time: {data_time * 1000:.1f}ms (step={step})")
+            
             z_indices = data.reshape(data.shape[0], -1)
             c_indices = target.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
+            
+            fwd_start = time.time()
             with torch.cuda.amp.autocast(dtype=ptdtype): # automatic mixed precision
                 _, loss = model(cond_idx=c_indices, idx=z_indices)
+            fwd_time = time.time() - fwd_start
                 
             # backward pass, with gradient scaling if training in fp16         
+            bwd_start = time.time()
             scaler.scale(loss).backward()
 
             if args.max_grad_norm != 0.0:
@@ -501,6 +512,7 @@ def main(args):
             # step the optimizer and scaler if training in fp16
             scaler.step(optimizer)
             scaler.update()
+            bwd_time = time.time() - bwd_start
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)  # zero out gradients
             if args.ema:
@@ -530,6 +542,7 @@ def main(args):
                 logger.info(f"(step={train_steps:07d}) Train Loss: {current_loss:.4f}, "+
                             f"Avg Train Loss: {avg_loss:.4f}, "+
                             f"Avg Step Time = {avg_step_time:.2f} sec, "+
+                            f"Data: {data_time*1000:.1f}ms, Fwd: {fwd_time*1000:.1f}ms, Bwd: {bwd_time*1000:.1f}ms, "+
                             f"Current learning rate: {current_lr:.6f}")
                 
                 if args.is_wandb_log and rank == 0: # log to wandb
