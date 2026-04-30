@@ -28,7 +28,7 @@ bash /mnt/afs/zhengmingkai/zyr/AdamAR-Yiran/scripts/autoregressive/train_c2i_met
     --freqs_cis_reorder_shceme output_reorder --interlacing_type adam --use_pass_aware_adaLN --use_class_aware_adaLN \
     --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
     --gpt-model GPT-Bcond --gpt-type c2i \
-    --global-batch-size 2048 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 4 \
+    --global-batch-size 256 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 4 \
     --ckpt-every 100 --log-every 100 \
     --no-compile --is-wandb-log --wandb_offline \
     --mixed-precision bf16
