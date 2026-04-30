@@ -648,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--profiler_port", type=int, default=9012, help="the port of investigation") 
     parser.add_argument("--profile", action='store_true', default=True)
-    parser.add_argument("--num-workers", type=int, default=8)  # Reduced from 24 to avoid CPU contention
+    parser.add_argument("--num-workers", type=int, default=24)  # Reduced from 24 to avoid CPU contention
     parser.add_argument("--warmup_percent", type=float, default=0.01, help="the ratio of warm-up steps in total number of steps")
     parser.add_argument("--const_percent", type=float, default=0.7, help="the ratio of steps with constant lr in total number of steps")
     parser.add_argument("--cosine_percent", type=float, default=None, help="the ratio of cosine annealing steps in total number of steps, if None, it will be calculated as 1.0 - warmup_percent - const_percent")
