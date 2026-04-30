@@ -15,11 +15,23 @@ bash /mnt/afs/zhengmingkai/zyr/AdamAR-Yiran/scripts/autoregressive/train_c2i.sh 
     --image-size 256 --adam-block-size 8 --pre_token_choose close_min \
     --freqs_cis_reorder_shceme output_reorder --interlacing_type adam --use_pass_aware_adaLN --use_class_aware_adaLN \
     --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
-    --gpt-model GPT-B --gpt-type c2i \
+    --gpt-model GPT-Bcond --gpt-type c2i \
     --global-batch-size 2048 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 400 \
     --ckpt-every 100 --log-every 100 \
     --no-compile --is-wandb-log --wandb_offline
 
+
+bash /mnt/afs/zhengmingkai/zyr/AdamAR-Yiran/scripts/autoregressive/train_c2i_metax.sh \
+    --cloud-save-path /mnt/datasets/AdamAR-Yiran/cloud_save \
+    --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode2/imagenet_code_256_c2i_flip_ten_crop \
+    --image-size 256 --adam-block-size 8 --pre_token_choose close_min \
+    --freqs_cis_reorder_shceme output_reorder --interlacing_type adam --use_pass_aware_adaLN --use_class_aware_adaLN \
+    --vq-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/vq_ds16_c2i.pt \
+    --gpt-model GPT-Bcond --gpt-type c2i \
+    --global-batch-size 2048 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 4 \
+    --ckpt-every 100 --log-every 100 \
+    --no-compile --is-wandb-log --wandb_offline \
+    --mixed-precision bf16
 
 # Sampling
 bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/sample_c2i_test.sh \

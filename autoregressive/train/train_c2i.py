@@ -229,7 +229,7 @@ def main(args):
         num_workers=args.num_workers,
         persistent_workers=True,
         prefetch_factor=args.prefetch_factor,
-        pin_memory=False
+        pin_memory=True
     )
     torch.manual_seed(seed)
 

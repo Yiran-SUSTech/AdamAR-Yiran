@@ -16,6 +16,8 @@ export MCCL_MAX_NCHANNELS=8
 export PYTHONUNBUFFERED=1
 export PYTORCH_ENABLE_SAME_RAND_A100=1
 export MCPYTORCH_DISABLE_PRINT=1
+export FORCE_ACTIVE_WAIT=2
+export MCCL_FAST_WRITE_BACK=1
 
 torchrun \
 --nnodes=$nnodes --nproc_per_node=$nproc_per_node --node_rank=$node_rank \
