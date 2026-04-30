@@ -45,7 +45,7 @@ def get_comm_backend(platform=None):
     
     # MetaX PyTorch uses NCCL backend API (implemented by MCCL underneath)
     if platform == 'metax':
-        return 'nccl'
+        return 'gloo'  # Changed to gloo for testing
     elif platform == 'nvidia':
         return 'nccl'
     else:
