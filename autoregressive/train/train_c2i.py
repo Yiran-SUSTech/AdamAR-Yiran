@@ -513,13 +513,19 @@ def main(args):
                 scaler.unscale_(optimizer) # gpu
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             # step the optimizer and scaler if training in fp16
+            opt_start = time.time()
             scaler.step(optimizer)
             scaler.update()
+            opt_time = time.time() - opt_start
             bwd_time = time.time() - bwd_start
             # flush the gradients as soon as we can, no need for this memory anymore
             optimizer.zero_grad(set_to_none=True)  # zero out gradients
             if args.ema:
+                ema_start = time.time()
                 update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
+                ema_time = time.time() - ema_start
+            else:
+                ema_time = 0
 
 
             current_lr = optimizer.param_groups[0]['lr'] # get current learning rate that is used to update parameters
@@ -538,14 +544,30 @@ def main(args):
                 end_time = time.time()
                 # steps_per_sec = log_steps / (end_time - start_time)
                 avg_step_time = (end_time - start_time) / log_steps
+                
+                log_sync_start = time.time()
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
+                
+                if args.is_wandb_log and rank == 0: # log to wandb
+                    wandb.log({"Iteration": train_steps, 
+                                "Avg_train_loss": avg_loss, 
+                                "Learning rate": current_lr}, step=train_steps)
+                dist.barrier()
+                log_sync_time = time.time() - log_sync_start
+                
+                # Memory monitoring
+                mem_allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+                mem_reserved = torch.cuda.memory_reserved(device) / 1024**3  # GB
+                
                 logger.info(f"(step={train_steps:07d}) Train Loss: {current_loss:.4f}, "+
                             f"Avg Train Loss: {avg_loss:.4f}, "+
                             f"Avg Step Time = {avg_step_time:.2f} sec, "+
                             f"Data: {data_time*1000:.1f}ms, Fwd: {fwd_time*1000:.1f}ms, Bwd: {bwd_time*1000:.1f}ms, "+
+                            f"Opt: {opt_time*1000:.1f}ms, EMA: {ema_time*1000:.1f}ms, LogSync: {log_sync_time*1000:.1f}ms, "+
+                            f"Mem: {mem_allocated:.2f}GB/{mem_reserved:.2f}GB, "+
                             f"Current learning rate: {current_lr:.6f}")
                 
                 if args.is_wandb_log and rank == 0: # log to wandb

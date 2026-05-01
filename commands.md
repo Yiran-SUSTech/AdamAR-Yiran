@@ -31,7 +31,7 @@ bash /mnt/afs/zhengmingkai/zyr/AdamAR-Yiran/scripts/autoregressive/train_c2i_met
     --global-batch-size 256 --min-lr 1e-5 --lr 0.0001 --max-lr 1e-4 --is-lr-scheduler --warmup_percent 0.25 --const_percent 0 --cosine_percent 0.75 --epochs 4 \
     --ckpt-every 100 --log-every 100 --num-workers 24\
     --no-compile --is-wandb-log --wandb_offline \
-    --mixed-precision bf16
+    --mixed-precision bf16 --gradient-accumulation-steps 1
 
 # Sampling
 bash /mnt/afs/zhengmingkai/zyr/AdamAR-GPU/scripts/autoregressive/sample_c2i_test.sh \
