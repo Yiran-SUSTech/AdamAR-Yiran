@@ -178,6 +178,9 @@ def main(args):
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
+    
+    # Enable cuDNN benchmark for faster convolution
+    torch.backends.cudnn.benchmark = True
 
     # Setup an experiment folder:
     experiment_index = len(glob(f"{args.results_dir}/*"))
