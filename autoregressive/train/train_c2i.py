@@ -503,6 +503,7 @@ def main(args):
             fwd_start = time.time()
             with torch.cuda.amp.autocast(dtype=ptdtype): # automatic mixed precision
                 _, loss = model(cond_idx=c_indices, idx=z_indices)
+            loss = loss / args.gradient_accumulation_steps  # Scale loss for gradient accumulation
             fwd_time = time.time() - fwd_start
                 
             # backward pass, with gradient scaling if training in fp16         
@@ -512,29 +513,39 @@ def main(args):
             if args.max_grad_norm != 0.0:
                 scaler.unscale_(optimizer) # gpu
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            # step the optimizer and scaler if training in fp16
-            opt_start = time.time()
-            scaler.step(optimizer)
-            scaler.update()
-            opt_time = time.time() - opt_start
-            bwd_time = time.time() - bwd_start
-            # flush the gradients as soon as we can, no need for this memory anymore
-            optimizer.zero_grad(set_to_none=True)  # zero out gradients
-            if args.ema:
-                ema_start = time.time()
-                update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
-                ema_time = time.time() - ema_start
+            
+            # Only step optimizer every gradient_accumulation_steps
+            is_accumulation_step = (step + 1) % args.gradient_accumulation_steps == 0
+            
+            if is_accumulation_step:
+                # step the optimizer and scaler if training in fp16
+                opt_start = time.time()
+                scaler.step(optimizer)
+                scaler.update()
+                opt_time = time.time() - opt_start
+                bwd_time = time.time() - bwd_start
+                # flush the gradients as soon as we can, no need for this memory anymore
+                optimizer.zero_grad(set_to_none=True)  # zero out gradients
+                
+                if args.ema:
+                    ema_start = time.time()
+                    update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
+                    ema_time = time.time() - ema_start
+                else:
+                    ema_time = 0
+                
+                current_lr = optimizer.param_groups[0]['lr'] # get current learning rate that is used to update parameters
+
+                if args.is_lr_scheduler:
+                    scheduler.step() # update learning rate
             else:
+                opt_time = 0
+                bwd_time = time.time() - bwd_start
                 ema_time = 0
-
-
-            current_lr = optimizer.param_groups[0]['lr'] # get current learning rate that is used to update parameters
-
-            if args.is_lr_scheduler:
-                scheduler.step() # update learning rate
+                current_lr = optimizer.param_groups[0]['lr']
 
             # Log loss values:
-            current_loss = loss.item()
+            current_loss = loss.item() * args.gradient_accumulation_steps  # Restore original loss scale
             running_loss += current_loss
             log_steps += 1
             train_steps += 1
