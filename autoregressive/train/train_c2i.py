@@ -17,6 +17,7 @@ import time
 import inspect
 import argparse
 import math
+import contextlib
 from thop import profile, clever_format
 
 import wandb
@@ -500,10 +501,15 @@ def main(args):
             c_indices = target.reshape(-1)
             assert z_indices.shape[0] == c_indices.shape[0]
             
+            # Only sync gradients every gradient_accumulation_steps
+            is_accumulation_step = (step + 1) % args.gradient_accumulation_steps == 0
+            
             fwd_start = time.time()
-            with torch.cuda.amp.autocast(dtype=ptdtype): # automatic mixed precision
-                _, loss = model(cond_idx=c_indices, idx=z_indices)
-            loss = loss / args.gradient_accumulation_steps  # Scale loss for gradient accumulation
+            # Use no_sync() to skip AllReduce during accumulation steps
+            with model.no_sync() if not is_accumulation_step else contextlib.nullcontext():
+                with torch.cuda.amp.autocast(dtype=ptdtype): # automatic mixed precision
+                    _, loss = model(cond_idx=c_indices, idx=z_indices)
+                loss = loss / args.gradient_accumulation_steps  # Scale loss for gradient accumulation
             fwd_time = time.time() - fwd_start
                 
             # backward pass, with gradient scaling if training in fp16         
